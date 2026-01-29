@@ -1,0 +1,113 @@
+# -*- coding: utf-8 -*-
+"""
+Script de diagnóstico: imprime pitch y roll en tiempo real
+para identificar cuál es el eje a usar en el control.
+"""
+import time
+import math
+from smbus2 import SMBus
+
+# MPU6050 addresses y registros
+MPU_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+GYRO_XOUT_H = 0x43
+ACCEL_SCALE = 16384.0  # LSB/g
+GYRO_SCALE = 131.0     # LSB/(°/s)
+
+class MPU6050:
+    def __init__(self, bus=1, addr=MPU_ADDR, dt=0.02, alpha=0.98):
+        self.bus = SMBus(bus)
+        self.addr = addr
+        self.dt = dt
+        self.alpha = alpha
+        # Inicializa el sensor
+        self.bus.write_byte_data(self.addr, PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+        self.gyro_bias = self._calibrate_gyro()
+        ax, ay, az, *_ = self._read_accel_gyro()
+        self.pitch, self.roll = self._accel_to_angles(ax, ay, az)
+
+    def _read_word(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg + 1)
+        val = (hi << 8) | lo
+        if val >= 0x8000:
+            val = -((65535 - val) + 1)
+        return val
+
+    def _read_accel_gyro(self):
+        ax = self._read_word(ACCEL_XOUT_H) / ACCEL_SCALE
+        ay = self._read_word(ACCEL_XOUT_H + 2) / ACCEL_SCALE
+        az = self._read_word(ACCEL_XOUT_H + 4) / ACCEL_SCALE
+        gx = self._read_word(GYRO_XOUT_H) / GYRO_SCALE
+        gy = self._read_word(GYRO_XOUT_H + 2) / GYRO_SCALE
+        gz = self._read_word(GYRO_XOUT_H + 4) / GYRO_SCALE
+        return ax, ay, az, gx, gy, gz
+
+    def _accel_to_angles(self, ax, ay, az):
+        roll = math.degrees(math.atan2(ay, az))
+        pitch = math.degrees(math.atan2(-ax, math.sqrt(ay * ay + az * az)))
+        return pitch, roll
+
+    def _calibrate_gyro(self, samples=200):
+        print("⏳ Calibrando giroscopio...")
+        sx = sy = sz = 0.0
+        for _ in range(samples):
+            _, _, _, gx, gy, gz = self._read_accel_gyro()
+            sx += gx
+            sy += gy
+            sz += gz
+            time.sleep(0.002)
+        return {"x": sx / samples, "y": sy / samples, "z": sz / samples}
+
+    def read_pitch_roll(self):
+        ax, ay, az, gx, gy, gz = self._read_accel_gyro()
+        gx -= self.gyro_bias["x"]
+        gy -= self.gyro_bias["y"]
+        pitch_gyro = self.pitch + gy * self.dt
+        roll_gyro = self.roll + gx * self.dt
+        pitch_acc, roll_acc = self._accel_to_angles(ax, ay, az)
+        self.pitch = self.alpha * pitch_gyro + (1 - self.alpha) * pitch_acc
+        self.roll = self.alpha * roll_gyro + (1 - self.alpha) * roll_acc
+        return self.pitch, self.roll
+
+
+def main():
+    print("=" * 60)
+    print("  IMU DIAGNOSTIC - Lectura contínua de Pitch y Roll")
+    print("=" * 60)
+    print("\nInstrucciones:")
+    print("  1. Coloca el sensor en POSICIÓN INICIAL (ángulo 0°).")
+    print("  2. Observa los valores de PITCH y ROLL.")
+    print("  3. INCLINA el sensor LENTAMENTE en la dirección que")
+    print("     quieres que controle (p. ej., hacia adelante).")
+    print("  4. El EJE QUE CAMBIA es el que debes usar en config.imu_axis")
+    print("  5. Presiona Ctrl+C para salir.\n")
+
+    try:
+        mpu = MPU6050(dt=0.02, alpha=0.98)
+        print("✅ MPU6050 inicializado correctamente.\n")
+        print("PITCH (°)      ROLL (°)       [inclina el sensor]\n")
+        print("-" * 60)
+
+        while True:
+            pitch, roll = mpu.read_pitch_roll()
+            print(
+                f"  {pitch:8.2f}          {roll:8.2f}",
+                end="\r",
+            )
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\n\n⛔ Diagnóstico interrumpido.")
+        print("\nResumen:")
+        print("  - Si PITCH cambió al inclinar: usa imu_axis = 'pitch'")
+        print("  - Si ROLL cambió al inclinar: usa imu_axis = 'roll'")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        print("   Verifica que la IMU esté conectada por I2C.")
+
+
+if __name__ == "__main__":
+    main()
