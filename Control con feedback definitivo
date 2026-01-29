@@ -113,7 +113,7 @@ ACCEL_SCALE = 16384.0  # LSB/g
 GYRO_SCALE  = 131.0    # LSB/(°/s)
 
 # ---- Direcciones del actuador ----
-DIR_EXTIENDE = 2  # Aumenta ángulo (roll)
+DIR_EXTIENDE = 0  # Aumenta ángulo (roll)
 DIR_RETRAE = 1    # Disminuye ángulo (roll)
 
 class MPU6050:
