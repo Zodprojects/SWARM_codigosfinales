@@ -55,10 +55,11 @@ class Config:
     PWM_MAX: int = 255               # PWM máximo
     PWM_SLEW: int = 25               # Cambio máximo de PWM por ciclo (suave)
     pwm_per_degree: float = 12.0     # PWM adicional por grado de error
+    can_send_interval: float = 0.1   # Intervalo mínimo entre envíos CAN (100ms)
     
     # --- Seguridad ---
     theta_min_deg: float = 0.0
-    theta_max_deg: float = 60.0
+    theta_max_deg: float = 90.0
     
     # --- Telemetría ---
     telemetry_hz: float = 5.0        # Frecuencia de impresión
@@ -175,6 +176,7 @@ class AnglePIDActuator:
         self._ei = 0.0      # Integral del error
         self._e_prev = 0.0  # Error anterior (para derivada)
         self._pwm_prev = 0  # PWM anterior (para slew-rate)
+        self._last_can_send = 0.0  # Tiempo del último envío CAN
 
     def _pid(self, e, dt):
         """Calcula la acción PID: u = Kp*e + Ki*ei + Kd*de"""
@@ -273,7 +275,15 @@ class AnglePIDActuator:
                     direccion = 0
                 else:
                     direccion = self._dir_from_u(u)
-                    self.act.send(direccion, pwm)
+                    # Solo envía CAN si ha pasado el intervalo mínimo
+                    now = time.perf_counter()
+                    if now - self._last_can_send >= self.cfg.can_send_interval:
+                        try:
+                            self.act.send(direccion, pwm)
+                            self._last_can_send = now
+                        except Exception as e_can:
+                            print(f"\n⚠️ Error CAN: {e_can}. Reintentando...")
+                            time.sleep(0.05)  # Pausa antes de reintentar
                 
                 # Telemetría
                 now = time.perf_counter()
