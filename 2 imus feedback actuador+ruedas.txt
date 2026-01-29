@@ -1,0 +1,426 @@
+# -*- coding: utf-8 -*-
+"""
+Pruebas simultáneas: ODrive (velocidad por rueda) + Actuador (dir/PWM) con feedback de IMU.
+Modos actuador:
+  - "seq"       -> reproduce cfg.actuador_seq (igual que antes)
+  - "angle_pid" -> cierra lazo en ángulo usando MPU6050 (pitch o roll) -> dir/PWM
+
+Requisitos:
+  pip install python-can smbus2 adafruit-circuitpython-bno055
+  Configurar can0 (ej.: 500 kbps).
+"""
+from __future__ import annotations
+import time, math, struct, threading, sys
+from dataclasses import dataclass
+
+# ======================= CONFIGURACIÓN =======================
+@dataclass
+class Config:
+    # --- CAN ---
+    can_channel: str = "can0"
+    can_bitrate: int = 500_000
+
+    # --- ODrive (CANSimple) ---
+    node_right: int = 1
+    node_left:  int = 2
+    wheel_radius: float = 0.08   # [m]
+    gear_ratio: float = 1.0      # motor->rueda
+    vmax_rev_s_clip: float = 20.0
+    sign_R: float = +1.0
+    sign_L: float = +1.0
+
+    # --- Rutina Ruedas ---
+    step_dt: float = 0.2           # [s]
+    test_total_s: float = 12.0     # [s]
+    wheel_steps_ms = [0.30]        # [m/s] constante
+
+    # --- Actuador (IDs fuera de bandas ODrive) ---
+    ACT_CAN_ID_CMD:  int = 0x321
+    ACT_CAN_ID_DATA: int = 0x322
+    act_refresh_s: float = 0.060   # reemisión para "seq"
+
+    # Modo actuador: "seq" o "angle_pid"
+    act_mode: str = "angle_pid"
+
+    # Secuencia (solo en "seq")
+    actuador_seq = [
+        (1, 120, 1.5),
+        ("wait", 0, 1.0),
+        (2, 150, 2.0),
+    ]
+
+    # --- Control por ángulo con MPU6050 ---
+    theta_ref_deg: float = 25.0    # referencia (grados)
+    imu_dt: float = 0.02           # 50 Hz
+    imu_alpha: float = 0.98        # filtro complementario
+    imu_sign: float = +1.0         # invierte si sube al revés (+1 o -1)
+    imu_axis: str = "pitch"        # "pitch" o "roll" (ángulo que sigue la flecha)
+
+    # PID
+    Kp: float = 3.0
+    Ki: float = 0.0
+    Kd: float = 0.25
+    I_clamp: float = 0.6
+    deadband_deg: float = 0.5      # margen sin mover
+
+    # Salida PWM
+    PWM_MAX: int = 255
+    PWM_MIN_EFF: int = 70          # mínimo efectivo para vencer fricción
+    PWM_SLEW: int = 50             # límite de cambio por ciclo (suaviza)
+
+    # Límites de operación
+    theta_min_deg: float = -5.0
+    theta_max_deg: float = 65.0
+    stall_timeout_s: float = 2.0   # sin cambio apreciable -> paro
+
+    # Telemetría
+    telemetry_hz: float = 10.0     # frecuencia de impresión (Hz)
+    show_both_axes: bool = True    # mostrar pitch y roll aunque controles solo uno
+
+    # (Opcional) BNO055 solo para comparar en log
+    use_bno055_telemetry: bool = False
+    bno_addr: int = 0x28
+
+# ======================= CAN Manager =======================
+class CanManager:
+    def __init__(self, cfg: Config):
+        import can
+        self.bus = can.interface.Bus(channel=cfg.can_channel, bustype="socketcan")
+    def shutdown(self):
+        try: self.bus.shutdown()
+        except Exception: pass
+
+# ======================= ODrive por CANSimple =======================
+SET_AXIS_STATE  = 0x07  # <u32>
+SET_INPUT_VEL   = 0x0D  # <f32 vel_rev_s, f32 torque_ff>
+AXIS_IDLE       = 1
+AXIS_CLOSEDLOOP = 8
+
+class ODriveCanDriver:
+    def __init__(self, cfg: Config, can_mgr: CanManager):
+        self.cfg = cfg
+        self.bus = can_mgr.bus
+        self._enabled = False
+    def _mk_msg(self, arb_id, data=b""):
+        import can
+        return can.Message(arbitration_id=arb_id, is_extended_id=False, data=data)
+    def set_axis_state(self, node_id: int, state: int):
+        msg_id = (node_id << 5) | SET_AXIS_STATE
+        self.bus.send(self._mk_msg(msg_id, struct.pack("<I", state)))
+    def start(self):
+        for nid in (self.cfg.node_right, self.cfg.node_left):
+            self.set_axis_state(nid, AXIS_CLOSEDLOOP)
+            time.sleep(0.01)
+        self._enabled = True
+    def stop(self):
+        try: self.send_wheel_speeds(0.0, 0.0)
+        except Exception: pass
+        time.sleep(0.02)
+        for nid in (self.cfg.node_right, self.cfg.node_left):
+            try: self.set_axis_state(nid, AXIS_IDLE)
+            except Exception: pass
+        self._enabled = False
+    def _ms_to_revs(self, v_ms: float) -> float:
+        return (v_ms / max(1e-9, self.cfg.wheel_radius)) / (2.0*math.pi) * self.cfg.gear_ratio
+    def send_wheel_speeds(self, vR_ms: float, vL_ms: float):
+        if not self._enabled: return
+        vmax = self.cfg.vmax_rev_s_clip
+        vR_rev = max(-vmax, min(vmax, self.cfg.sign_R * self._ms_to_revs(vR_ms)))
+        vL_rev = max(-vmax, min(vmax, self.cfg.sign_L * self._ms_to_revs(vL_ms)))
+        msg_id_R = (self.cfg.node_right << 5) | SET_INPUT_VEL
+        msg_id_L = (self.cfg.node_left  << 5) | SET_INPUT_VEL
+        self.bus.send(self._mk_msg(msg_id_R, struct.pack("<ff", float(vR_rev), 0.0)))
+        self.bus.send(self._mk_msg(msg_id_L, struct.pack("<ff", float(vL_rev), 0.0)))
+
+# ======================= Actuador (dir/PWM con refresco) =======================
+class ActuadorDPWM:
+    """TX: arbitration_id=cfg.ACT_CAN_ID_CMD, data=[dir, pwm]. Paro: [0,0]."""
+    def __init__(self, cfg: Config, can_mgr: CanManager):
+        self.cfg = cfg
+        self.bus = can_mgr.bus
+    def _send(self, direccion: int, pwm: int):
+        import can
+        direccion = int(direccion) & 0xFF
+        pwm = int(pwm) & 0xFF
+        msg = can.Message(arbitration_id=self.cfg.ACT_CAN_ID_CMD,
+                          data=[direccion, pwm],
+                          is_extended_id=False)
+        self.bus.send(msg)
+    def enviar_comando(self, direccion: int, pwm: int, duracion: float):
+        t_end = time.perf_counter() + max(0.0, float(duracion))
+        try:
+            while time.perf_counter() < t_end:
+                self._send(direccion, pwm)
+                print(f"🟢 Actuador → dir:{direccion} pwm:{pwm}")
+                time.sleep(self.cfg.act_refresh_s)
+            self._send(0, 0)
+            print("🛑 Actuador detenido.")
+        except Exception as e:
+            print("❌ Error CAN (actuador):", e)
+    def stop(self):
+        try: self._send(0, 0)
+        except: pass
+
+# ======================= IMUs =======================
+from smbus2 import SMBus
+MPU_ADDR = 0x68
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+GYRO_XOUT_H  = 0x43
+ACCEL_SCALE = 16384.0
+GYRO_SCALE  = 131.0
+
+class MPU6050:
+    def __init__(self, bus=1, addr=MPU_ADDR, dt=0.02, alpha=0.98):
+        self.bus = SMBus(bus)
+        self.addr = addr
+        self.dt = dt
+        self.alpha = alpha
+        self.bus.write_byte_data(self.addr, PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+        self.gyro_bias = self.calibrate_gyro()
+        ax, ay, az, _, _, _ = self.read_accel_gyro()
+        self.pitch, self.roll = self.accel_to_angles(ax, ay, az)
+    def read_word(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg+1)
+        val = (hi << 8) | lo
+        if val >= 0x8000: val = -((65535 - val) + 1)
+        return val
+    def read_accel_gyro(self):
+        ax = self.read_word(ACCEL_XOUT_H)     / ACCEL_SCALE
+        ay = self.read_word(ACCEL_XOUT_H+2)   / ACCEL_SCALE
+        az = self.read_word(ACCEL_XOUT_H+4)   / ACCEL_SCALE
+        gx = self.read_word(GYRO_XOUT_H)      / GYRO_SCALE
+        gy = self.read_word(GYRO_XOUT_H+2)    / GYRO_SCALE
+        gz = self.read_word(GYRO_XOUT_H+4)    / GYRO_SCALE
+        return ax, ay, az, gx, gy, gz
+    def accel_to_angles(self, ax, ay, az):
+        roll  = math.degrees(math.atan2(ay, az))
+        pitch = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
+        return pitch, roll
+    def calibrate_gyro(self, samples=200):
+        sx = sy = sz = 0.0
+        for _ in range(samples):
+            _, _, _, gx, gy, gz = self.read_accel_gyro()
+            sx += gx; sy += gy; sz += gz
+            time.sleep(0.002)
+        return {'x': sx/samples, 'y': sy/samples, 'z': sz/samples}
+    def read_pitch_roll(self):
+        ax, ay, az, gx, gy, gz = self.read_accel_gyro()
+        gx -= self.gyro_bias['x']; gy -= self.gyro_bias['y']
+        pitch_gyro = self.pitch + gy * self.dt
+        roll_gyro  = self.roll  + gx * self.dt
+        pitch_acc, roll_acc = self.accel_to_angles(ax, ay, az)
+        self.pitch = self.alpha * pitch_gyro + (1 - self.alpha) * pitch_acc
+        self.roll  = self.alpha * roll_gyro  + (1 - self.alpha) * roll_acc
+        return self.pitch, self.roll
+
+class BNO055_IMU:
+    def __init__(self, addr=0x28):
+        import board, adafruit_bno055
+        i2c = board.I2C()
+        self.sensor = adafruit_bno055.BNO055_I2C(i2c, address=addr)
+    def read_pitch_roll(self):
+        euler = self.sensor.euler
+        if euler is None: return None, None
+        heading, roll, pitch = euler
+        return pitch, roll
+
+# ======================= Control por Ángulo (Actuador) =======================
+class AnglePIDActuator:
+    def __init__(self, cfg: Config, act_hw: ActuadorDPWM):
+        self.cfg = cfg
+        self.act = act_hw
+        self.mpu = MPU6050(dt=cfg.imu_dt, alpha=cfg.imu_alpha)
+        self.bno = BNO055_IMU(cfg.bno_addr) if cfg.use_bno055_telemetry else None
+        self._run = True
+        self._ei = 0.0
+        self._e_prev = 0.0
+        self._pwm_prev = 0
+        self._last_theta = None
+        self._last_change_t = time.perf_counter()
+        self._telemetry_last = 0.0
+
+    def _pid(self, e, dt):
+        self._ei += e*dt
+        self._ei = max(-self.cfg.I_clamp, min(self.cfg.I_clamp, self._ei))
+        de = (e - self._e_prev)/max(1e-3, dt)
+        self._e_prev = e
+        return self.cfg.Kp*e + self.cfg.Ki*self._ei + self.cfg.Kd*de
+
+    def _pwm_from_u(self, u):
+        mag = abs(u)
+        if mag < self.cfg.deadband_deg:
+            pwm = 0
+        else:
+            pwm = int(min(self.cfg.PWM_MAX, self.cfg.PWM_MIN_EFF + 5.0*mag))
+        dp = max(-self.cfg.PWM_SLEW, min(self.cfg.PWM_SLEW, pwm - self._pwm_prev))
+        pwm = self._pwm_prev + dp
+        self._pwm_prev = pwm
+        return pwm
+
+    def _dir_from_u(self, u):
+        return 1 if u > 0 else 2  # define: u>0 subir espejo (ajusta si invierte)
+
+    def stop(self):
+        self._run = False
+        self.act.stop()
+
+    def _print_status(self, theta_sel, pitch, roll, e, direccion, pwm):
+        now = time.perf_counter()
+        if now - self._telemetry_last >= (1.0 / max(1e-3, self.cfg.telemetry_hz)):
+            self._telemetry_last = now
+            eje = self.cfg.imu_axis
+            if self.cfg.show_both_axes:
+                line = (f"θref={self.cfg.theta_ref_deg:5.1f}°  "
+                        f"θ{eje}={theta_sel:6.2f}°  "
+                        f"pitch={pitch:6.2f}°  roll={roll:6.2f}°  "
+                        f"e={e:6.2f}°  dir/pwm={direccion if pwm else 0}/{pwm:3d}")
+            else:
+                line = (f"θref={self.cfg.theta_ref_deg:5.1f}°  "
+                        f"θ{eje}={theta_sel:6.2f}°  e={e:6.2f}°  "
+                        f"dir/pwm={direccion if pwm else 0}/{pwm:3d}")
+            sys.stdout.write("\r" + line + " " * 6)
+            sys.stdout.flush()
+
+    def run(self):
+        print("▶️ Control ángulo (MPU6050) activo.")
+        dt = self.cfg.imu_dt
+        while self._run:
+            t0 = time.perf_counter()
+            pitch, roll = self.mpu.read_pitch_roll()
+            if pitch is None or (pitch != pitch):
+                print("⚠️ IMU no válida. Paro.")
+                self.stop(); break
+
+            # Elegir eje
+            theta_sel = pitch if self.cfg.imu_axis.lower() == "pitch" else roll
+            theta_sel *= self.cfg.imu_sign
+
+            # límites de seguridad
+            if theta_sel < self.cfg.theta_min_deg - 2 or theta_sel > self.cfg.theta_max_deg + 2:
+                print(f"\n⛔ θ fuera de rango ({theta_sel:.1f}°). Paro.")
+                self.stop(); break
+
+            # estancamiento
+            if self._last_theta is not None and abs(theta_sel - self._last_theta) > 0.2:
+                self._last_change_t = t0
+            self._last_theta = theta_sel
+            if (t0 - self._last_change_t) > self.cfg.stall_timeout_s:
+                print("\n⛔ Estancado (sin movimiento). Paro.")
+                self.stop(); break
+
+            # PID
+            e = (self.cfg.theta_ref_deg - theta_sel)
+            u = self._pid(e, dt)
+            pwm = self._pwm_from_u(u)
+            if pwm == 0:
+                self.act._send(0, 0)
+                direccion = 0
+            else:
+                direccion = self._dir_from_u(u)
+                self.act._send(direccion, pwm)
+
+            # Telemetría en vivo
+            self._print_status(theta_sel, pitch, roll, e, direccion, pwm)
+
+            # ciclo
+            t_spent = time.perf_counter() - t0
+            time.sleep(max(0.0, dt - t_spent))
+        # salto de línea al salir para no pisar consola
+        print("")
+
+# ======================= Rutina de PRUEBAS =======================
+class TestRoutine:
+    """
+    Hilo ruedas: reproduce wheel_steps_ms hasta test_total_s.
+    Hilo actuador:
+      - "seq": ejecuta actuador_seq
+      - "angle_pid": mantiene θ≈θ_ref mientras duren las ruedas (o hasta stop)
+    """
+    def __init__(self, cfg: Config, drive: ODriveCanDriver, act: ActuadorDPWM):
+        self.cfg = cfg
+        self.drive = drive
+        self.act = act
+        self._run = True
+        self._pid_act: AnglePIDActuator | None = None
+
+    def _thread_ruedas(self):
+        t_end = time.perf_counter() + self.cfg.test_total_s
+        while self._run and time.perf_counter() < t_end:
+            for v in self.cfg.wheel_steps_ms:
+                if not self._run or time.perf_counter() >= t_end:
+                    break
+                self.drive.send_wheel_speeds(v, v)  # avance recto
+                print(f"\n🛞 v_cmd = {v:+.3f} m/s")  # salto de línea para no pisar telemetría
+                time.sleep(self.cfg.step_dt)
+        self.drive.send_wheel_speeds(0.0, 0.0)
+
+    def _thread_actuador_seq(self):
+        for paso in self.cfg.actuador_seq:
+            if not self._run: break
+            if isinstance(paso[0], str) and paso[0].lower() == "wait":
+                _, _, t_wait = paso
+                print(f"\n⏸️ Espera actuador {t_wait:.2f}s")
+                time.sleep(max(0.0, float(t_wait)))
+                continue
+            direccion, pwm, dur = paso
+            self.act.enviar_comando(int(direccion), int(pwm), float(dur))
+        self.act.stop()
+
+    def _thread_actuador_pid(self):
+        self._pid_act = AnglePIDActuator(self.cfg, self.act)
+        try:
+            self._pid_act.run()
+        finally:
+            self.act.stop()
+
+    def run(self):
+        th_w = threading.Thread(target=self._thread_ruedas, daemon=True)
+        th_w.start()
+        if self.cfg.act_mode.lower() == "seq":
+            th_a = threading.Thread(target=self._thread_actuador_seq, daemon=True)
+        else:
+            th_a = threading.Thread(target=self._thread_actuador_pid, daemon=True)
+        th_a.start()
+        try:
+            t0 = time.perf_counter()
+            while (time.perf_counter() - t0) < self.cfg.test_total_s:
+                time.sleep(0.1)
+        except KeyboardInterrupt:
+            print("\n⛔ Interrupción usuario")
+        finally:
+            self._run = False
+            try:
+                if self._pid_act: self._pid_act.stop()
+            except: pass
+            time.sleep(0.3)
+
+# ======================= MAIN =======================
+def main():
+    cfg = Config()
+    canm = CanManager(cfg)
+    drive = ODriveCanDriver(cfg, canm)
+    act   = ActuadorDPWM(cfg, canm)
+    print(f"▶️ Iniciando: Ruedas + Actuador (modo={cfg.act_mode}). Ctrl-C para parar.")
+    try:
+        drive.start()
+        routine = TestRoutine(cfg, drive, act)
+        routine.run()
+    except KeyboardInterrupt:
+        print("\n⛔ Interrupción usuario")
+    except Exception as e:
+        print("❌ FAULT:", e)
+    finally:
+        print("\n🛑 Parando…")
+        try: drive.stop()
+        except: pass
+        try: act.stop()
+        except: pass
+        try: canm.shutdown()
+        except: pass
+        print("✅ Listo.")
+
+if __name__ == "__main__":
+    main()
