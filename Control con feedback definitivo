@@ -116,7 +116,7 @@ DIR_EXTIENDE = 2  # Aumenta ángulo (roll)
 DIR_RETRAE = 1    # Disminuye ángulo (roll)
 
 class MPU6050:
-    def __init__(self, bus=1, addr=MPU_ADDR, dt=0.02, alpha=0.98):
+    def __init__(self, bus=1, addr=0x68, dt=0.02, alpha=0.98):
         self.bus = SMBus(bus)
         self.addr = addr
         self.dt = dt
