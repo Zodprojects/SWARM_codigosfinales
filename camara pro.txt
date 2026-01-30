@@ -1,0 +1,272 @@
+import math
+import cv2
+import numpy as np
+from picamera2 import Picamera2
+import time
+import board
+import busio
+import adafruit_bno055
+
+# ---------------------------
+# Parámetros de calibración obtenidos
+camera_matrix = np.array([[1.82798542e+03, 0.0, 5.72342464e+02],
+                            [0.0, 1.82504450e+03, 3.62602479e+02],
+                            [0.0, 0.0, 1.0]], dtype=np.float32)
+dist_coeffs = np.array([[4.95174274e-03, 2.65701920e+00, -1.43227501e-03, -1.14715430e-02, -1.37391077e+01]], dtype=np.float32)
+# ---------------------------
+
+# Variables para el mapa
+map_size = 450  # Tamaño del mapa (en píxeles)
+scale = 4       # Escala para convertir distancias reales a píxeles en el mapa
+
+# Inicialización del sensor IMU
+i2c = busio.I2C(board.SCL, board.SDA)
+sensor = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+
+input("Coloca el robot mirando al objeto y presiona ENTER para guardar la referencia...")
+yaw_referencia = sensor.euler[0]  # Guarda la orientación de referencia (yaw)
+
+# Configuración de la cámara
+picam2 = Picamera2()
+picam2.preview_configuration.main.size = (1280, 720)
+picam2.preview_configuration.main.format = "RGB888"
+picam2.preview_configuration.align()
+picam2.configure("preview")
+picam2.start()
+
+# Parámetros de la cámara
+FOCAL_LENGTH = camera_matrix[0, 0]  # Aproximadamente 1827.99
+FOV_HORIZONTAL = 62.2  # en grados
+
+# Dimensiones reales del objeto (en cm)
+# Se asume un rectángulo de 6 x 10 cm (por ejemplo, la tela con marcas)
+REAL_WIDTH = 6.0    
+REAL_HEIGHT = 10.0   
+
+def dibujar_mapa(frame, X_robot, Y_robot, error_yaw):
+    """ 
+    Dibuja un mapa en la esquina inferior izquierda de 'frame', indicando la posición y orientación del robot.
+    """
+    map_frame = np.ones((map_size, map_size, 3), dtype=np.uint8) * 255  
+    center = (map_size // 2, map_size // 2)  
+
+    # Dibujar cuadrícula rectangular con líneas finas
+    grid_spacing = 90  
+    for i in range(center[0] % grid_spacing, map_size, grid_spacing):
+        cv2.line(map_frame, (i, 0), (i, map_size), (180, 180, 180), 1, cv2.LINE_AA)
+        cv2.line(map_frame, (0, i), (map_size, i), (180, 180, 180), 1, cv2.LINE_AA)
+
+    # Dibujar malla radial
+    for r in range(60, map_size // 2, 90):
+        cv2.circle(map_frame, center, r, (160, 160, 160), 1, cv2.LINE_AA)
+
+    # Dibujar líneas de ángulos principales cada 45°
+    for angle in range(0, 360, 45):  
+        rad = math.radians(angle)
+        x_end = int(center[0] + (map_size // 2.3) * math.cos(rad))
+        y_end = int(center[1] - (map_size // 2.3) * math.sin(rad))
+        cv2.line(map_frame, center, (x_end, y_end), (160, 160, 160), 1, cv2.LINE_AA)
+
+    # Marcar los ángulos principales (cada 90°)
+    for angle in range(0, 360, 90):
+        rad = math.radians(angle)
+        x_text = int(center[0] + (map_size // 2.5) * math.cos(rad))
+        y_text = int(center[1] - (map_size // 2.5) * math.sin(rad))
+        cv2.putText(map_frame, f"{angle} º", (x_text, y_text),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+
+    # Dibujar ejes principales
+    cv2.line(map_frame, (0, center[1]), (map_size, center[1]), (0, 0, 0), 2, cv2.LINE_AA)  
+    cv2.line(map_frame, (center[0], 0), (center[0], map_size), (0, 0, 0), 2, cv2.LINE_AA)  
+
+    # Dibujar la "Torre" (objeto) en el centro del mapa (rojo)
+    cv2.circle(map_frame, center, 10, (0, 0, 255), -1)
+    cv2.putText(map_frame, "Torre", (center[0] + 15, center[1] - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # Convertir la posición del robot a coordenadas del mapa
+    robot_x = int(center[0] - X_robot * scale)
+    robot_y = int(center[1] + Y_robot * scale)  
+
+    # Dibujar el robot (azul)
+    cv2.circle(map_frame, (robot_x, robot_y), 10, (255, 0, 0), -1)
+    cv2.putText(map_frame, "ROBOT", (robot_x + 15, robot_y - 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2, cv2.LINE_AA)
+
+    # Dibujar la orientación del robot con una flecha (amarilla)
+    arrow_length = 45  
+    arrow_x = int(robot_x + arrow_length * math.sin(math.radians(error_yaw)))
+    arrow_y = int(robot_y - arrow_length * math.cos(math.radians(error_yaw)))
+    cv2.arrowedLine(map_frame, (robot_x, robot_y), (arrow_x, arrow_y), (255, 255, 0), 3, cv2.LINE_AA, tipLength=0.4)
+
+    # Insertar el mapa en la esquina inferior izquierda de la imagen principal
+    h, w, _ = frame.shape
+    frame[h - map_size:h, 0:map_size] = map_frame  
+
+    return frame
+
+def detectar_marcas(frame):
+    """
+    Detecta las marcas blancas en la tela negra y retorna los centros (2D) de las regiones detectadas.
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Umbral para segmentar las marcas (ajusta según condiciones de iluminación)
+    _, thresh = cv2.threshold(blur, 180, 255, cv2.THRESH_BINARY)
+    cv2.imshow("Threshold", thresh)  # Muestra la imagen umbralizada para depuración
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    marcas = []
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        # Ajusta el rango de área según el tamaño real de las marcas (en píxeles)
+        if 30 < area < 1500:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cX = int(M["m10"] / M["m00"])
+                cY = int(M["m01"] / M["m00"])
+                marcas.append([cX, cY])
+    return np.array(marcas, dtype=np.float32)
+
+def order_points(pts):
+    """
+    Ordena 4 puntos en el orden: superior izquierda, superior derecha, inferior derecha, inferior izquierda.
+    """
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+while True:
+    # Capturar el frame de la cámara
+    frame = picam2.capture_array()
+    
+    # Corregir distorsión usando la calibración
+    frame_undistorted = cv2.undistort(frame, camera_matrix, dist_coeffs)
+    cv2.imshow("Undistorted", frame_undistorted)
+    
+    # Detectar las marcas en la imagen undistorted
+    marcas = detectar_marcas(frame_undistorted)
+    
+    # Valores por defecto
+    distance_cm = 0
+    distance_horizontal = 0
+    brightness_status = "No detection"
+    offset_brightness = 0
+    avg_brightness_center = 0
+    
+    if len(marcas) == 4:
+        # Ordenar las marcas de forma consistente
+        marcas_ordenadas = order_points(marcas)
+        for (x, y) in marcas_ordenadas:
+            cv2.circle(frame_undistorted, (int(x), int(y)), 5, (0, 0, 255), -1)
+        
+        # Estimación de pose con solvePnP
+        object_points = np.array([
+            [0, 0, 0],
+            [REAL_WIDTH, 0, 0],
+            [REAL_WIDTH, REAL_HEIGHT, 0],
+            [0, REAL_HEIGHT, 0]
+        ], dtype=np.float32)
+        image_points = marcas_ordenadas.astype(np.float32)
+        ret, rvec, tvec = cv2.solvePnP(object_points, image_points, camera_matrix, dist_coeffs)
+        if ret:
+            distance_cm = tvec[2][0]  # Distancia a lo largo del eje óptico (en cm)
+        else:
+            distance_cm = 0
+        
+        # Obtener el ángulo de inclinación (pitch) de la IMU (se asume sensor.euler[2])
+        pitch_actual = sensor.euler[2]
+        pitch_rad = math.radians(pitch_actual)
+        # Descomponer la distancia en su componente horizontal (paralela al suelo)
+        distance_horizontal = distance_cm * math.cos(pitch_rad+90)
+        
+        # Calcular el centro del cuadrilátero formado por las marcas
+        center_obj = np.mean(marcas_ordenadas, axis=0)
+        cx, cy = int(center_obj[0]), int(center_obj[1])
+        
+        # --- Detección de luminosidad en el área delimitada ---
+        pts = marcas_ordenadas.astype(np.int32)
+        mask = np.zeros((frame_undistorted.shape[0], frame_undistorted.shape[1]), dtype=np.uint8)
+        cv2.fillPoly(mask, [pts], 255)
+        gray_frame = cv2.cvtColor(frame_undistorted, cv2.COLOR_BGR2GRAY)
+        
+        # Extraer una ventana pequeña centrada en el centro del cuadrilátero (20x20 píxeles)
+        window_size = 20
+        x1 = max(cx - window_size // 2, 0)
+        y1 = max(cy - window_size // 2, 0)
+        x2 = min(cx + window_size // 2, gray_frame.shape[1] - 1)
+        y2 = min(cy + window_size // 2, gray_frame.shape[0] - 1)
+        center_window = gray_frame[y1:y2, x1:x2]
+        avg_brightness_center = np.mean(center_window)
+        
+        # Umbral de brillo para determinar si el rayo incide en el centro
+        brightness_threshold = 200
+        if avg_brightness_center >= brightness_threshold:
+            brightness_status = "Correct"
+            offset_brightness = 0
+            bright_point = (cx, cy)
+        else:
+            brightness_status = "Not centered"
+            masked_gray = cv2.bitwise_and(gray_frame, gray_frame, mask=mask)
+            (minVal, maxVal, minLoc, maxLoc) = cv2.minMaxLoc(masked_gray)
+            bright_point = maxLoc
+            offset_brightness = np.linalg.norm(np.array(bright_point) - np.array([cx, cy]))
+        
+        # Dibujar el centro calculado (círculo azul) y el punto de máxima luminosidad (círculo verde)
+        cv2.circle(frame_undistorted, (cx, cy), 5, (255, 0, 0), 2)
+        cv2.circle(frame_undistorted, bright_point, 5, (0, 255, 0), -1)
+    else:
+        height_img, width_img, _ = frame_undistorted.shape
+        center_obj = np.array([width_img / 2, height_img / 2])
+        cx, cy = int(center_obj[0]), int(center_obj[1])
+        bright_point = (cx, cy)
+    
+    # Calcular el offset horizontal del objeto (en grados) basado en el centro de las marcas
+    height_img, width_img, _ = frame_undistorted.shape
+    if len(marcas) > 0:
+        center_obj = np.mean(marcas, axis=0)
+    else:
+        center_obj = np.array([width_img / 2, height_img / 2])
+    offset_x = center_obj[0] - (width_img / 2)
+    offset_angle = (offset_x / (width_img / 2)) * (FOV_HORIZONTAL / 2)
+    
+    # Obtener datos de la IMU para calcular la posición del robot (usando yaw)
+    yaw_actual = sensor.euler[0]
+    error_yaw = yaw_actual - yaw_referencia
+    error_yaw_rad = math.radians(error_yaw)
+    X_robot = distance_horizontal * math.sin(error_yaw_rad)
+    Y_robot = distance_horizontal * math.cos(error_yaw_rad)
+    
+    # --- INTERFAZ: Dibujar el mapa en la esquina inferior izquierda ---
+    frame_with_map = dibujar_mapa(frame_undistorted.copy(), X_robot, Y_robot, error_yaw)
+    
+    # --- INFORMACIÓN EN PANTALLA ---
+    band_height = 150
+    band = np.zeros((band_height, width_img, 3), dtype=np.uint8)
+    info_text1 = f"Dist: {distance_cm:.1f}cm | Horiz: {distance_horizontal:.1f}cm | Offset: {offset_angle:.1f}grados"
+    info_text2 = f"Yaw act: {yaw_actual:.2f} grados | Error: {error_yaw:.2f}grados"
+    info_text3 = f"Pos: X={X_robot:.1f}cm, Y={Y_robot:.1f}cm"
+    info_text4 = f"Pitch: {sensor.euler[2]:.2f}grados"
+    info_text5 = f"Brightness: {avg_brightness_center:.1f} | {brightness_status}"
+    if brightness_status == "Not centered":
+        info_text5 += f" (Off: {offset_brightness:.1f}px)"
+    
+    cv2.putText(band, info_text1, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    cv2.putText(band, info_text2, (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    cv2.putText(band, info_text3, (10, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    cv2.putText(band, info_text4, (10, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    cv2.putText(band, info_text5, (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    
+    # Combinar la imagen con mapa y la banda de información
+    final_display = cv2.vconcat([frame_with_map, band])
+    cv2.imshow("Visualizacion", final_display)
+    
+    if cv2.waitKey(1) == ord("q"):
+        break
+
+cv2.destroyAllWindows()
