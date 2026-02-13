@@ -454,27 +454,36 @@ class MapVisualizer:
         
         # Panel de información
         self.ax_info.axis('off')
-        self.info_text = self.ax_info.text(0.05, 0.95, '', fontsize=11, 
+        self.info_text = self.ax_info.text(0.05, 0.95, 'Inicializando...', fontsize=11, 
                                            verticalalignment='top', fontfamily='monospace')
         
-        # Panel de cámara
+        # Panel de cámara - inicializar con placeholder
         self.ax_camera.set_title('Detección de Rayo', fontsize=14, fontweight='bold')
         self.ax_camera.axis('off')
-        self.camera_image = None
+        
+        # Crear imagen placeholder inicial
+        placeholder = np.ones((480, 640, 3), dtype=np.uint8) * 128  # Gris medio
+        self.camera_image = self.ax_camera.imshow(placeholder)
+        self.camera_text = self.ax_camera.text(0.5, 0.5, 'Esperando imagen de cámara...', 
+                                               transform=self.ax_camera.transAxes,
+                                               ha='center', va='center', fontsize=14, 
+                                               color='white', weight='bold',
+                                               bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
         
         plt.tight_layout()
-        plt.show(block=False)
-        
-        # Dibujar inicial
         self.fig.canvas.draw()
+        plt.show(block=False)
         self.fig.canvas.flush_events()
         plt.pause(0.1)
+        
+        print("✅ Ventana de visualización creada")
     
     def update(self, ray_info: Dict, current_tilt: float, target_tilt: float):
         """Actualiza la visualización con nueva información"""
-        # Actualizar posición del helióstato
-        x, y = ray_info['x_m'], ray_info['y_m']
-        psi = ray_info['psi']
+        try:
+            # Actualizar posición del helióstato
+            x, y = ray_info['x_m'], ray_info['y_m']
+            psi = ray_info['psi']
         
         self.helio_body.set_center((x, y))
         
@@ -538,23 +547,18 @@ Offset X:    {ray_info['offset_x']:+6.1f} px
             else:
                 frame_rgb = frame
             
-            if self.camera_image is None:
-                self.camera_image = self.ax_camera.imshow(frame_rgb)
-            else:
-                self.camera_image.set_data(frame_rgb)
-        else:
-            # Mostrar mensaje si no hay frame
-            if self.camera_image is None:
-                placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
-                self.camera_image = self.ax_camera.imshow(placeholder)
-                self.ax_camera.text(0.5, 0.5, 'Esperando imagen...', 
-                                   transform=self.ax_camera.transAxes,
-                                   ha='center', va='center', fontsize=16, color='white')
+            self.camera_image.set_data(frame_rgb)
+            
+            # Remover texto placeholder si existe
+            if hasattr(self, 'camera_text') and self.camera_text:
+                self.camera_text.set_visible(False)
         
-        # Redibujar
-        self.fig.canvas.draw()
-        self.fig.canvas.flush_events()
-        plt.pause(0.001)
+            # Redibujar
+            self.fig.canvas.draw()
+            self.fig.canvas.flush_events()
+            plt.pause(0.001)
+        except Exception as e:
+            print(f"\n⚠️ Error actualizando visualización: {e}")
     
     def close(self):
         plt.close(self.fig)
@@ -567,8 +571,10 @@ class TiltCameraController:
         self.mpu = MPU6050(cfg)
         self.tilt = TiltActuator(cfg, self.canm, self.mpu)
         self.camera = CameraDetection(cfg)
+        print("\n📊 Creando ventana de visualización...")
         self.map_viz = MapVisualizer(cfg)
         print("\n✅ Controlador tilt+cámara inicializado\n")
+        print("Si la ventana no aparece, verifica que tengas acceso al display (DISPLAY variable en SSH)")
     
     def run_test(self, target_tilt_deg: float, duration_s: float = 120.0):
         """
