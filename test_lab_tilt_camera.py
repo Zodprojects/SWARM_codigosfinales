@@ -61,17 +61,8 @@ class Config:
     mpu_dt: float = 0.02
     mpu_alpha: float = 0.98
     
-    # Corrección automática de rayo
-    enable_ray_correction: bool = True
-    ray_threshold_px: float = 5.0           # Umbral para activar corrección
-    ray_vertical_threshold: float = 3.0     # Umbral vertical mínimo
-    tilt_correction_factor: float = 0.08    # Factor corrección (°/px)
+    # Detección de rayo
     brightness_threshold: int = 200         # Umbral brillo para "Correct"
-    
-    # Control adaptativo
-    correction_speed_slow: float = 0.03     # Factor corrección cuando está cerca
-    correction_speed_fast: float = 0.10     # Factor corrección cuando está lejos
-    slow_threshold_px: float = 20.0         # Umbral para cambiar velocidad
 
 # ======================= UTILIDADES =======================
 def wrap_angle(a):
@@ -423,10 +414,6 @@ class CameraDetection:
         
         result['frame'] = frame_u
         
-        # Mostrar frame
-        self.cv2.imshow("Test Tilt - Detección Rayo", frame_u)
-        self.cv2.waitKey(1)
-        
         return result
 
 # ======================= VISUALIZACIÓN MAPA =======================
@@ -435,7 +422,13 @@ class MapVisualizer:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         plt.ion()  # Modo interactivo
-        self.fig, (self.ax_map, self.ax_info) = plt.subplots(1, 2, figsize=(14, 7))
+        self.fig = plt.figure(figsize=(18, 7))
+        
+        # Crear grid de subplots: [mapa | info | cámara]
+        gs = self.fig.add_gridspec(1, 3, width_ratios=[1.2, 0.8, 1.5])
+        self.ax_map = self.fig.add_subplot(gs[0])
+        self.ax_info = self.fig.add_subplot(gs[1])
+        self.ax_camera = self.fig.add_subplot(gs[2])
         
         # Configurar eje del mapa
         self.ax_map.set_xlim(-8, 8)
@@ -463,6 +456,11 @@ class MapVisualizer:
         self.ax_info.axis('off')
         self.info_text = self.ax_info.text(0.05, 0.95, '', fontsize=11, 
                                            verticalalignment='top', fontfamily='monospace')
+        
+        # Panel de cámara
+        self.ax_camera.set_title('Detección de Rayo', fontsize=14, fontweight='bold')
+        self.ax_camera.axis('off')
+        self.camera_image = None
         
         plt.tight_layout()
         plt.show(block=False)
@@ -527,6 +525,20 @@ Offset X:    {ray_info['offset_x']:+6.1f} px
         
         self.info_text.set_text(info.strip())
         
+        # Actualizar imagen de cámara
+        if 'frame' in ray_info and ray_info['frame'] is not None:
+            frame = ray_info['frame']
+            # Convertir BGR a RGB para matplotlib
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                frame_rgb = frame[:, :, ::-1]  # BGR -> RGB
+            else:
+                frame_rgb = frame
+            
+            if self.camera_image is None:
+                self.camera_image = self.ax_camera.imshow(frame_rgb)
+            else:
+                self.camera_image.set_data(frame_rgb)
+        
         # Redibujar
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
@@ -546,51 +558,32 @@ class TiltCameraController:
         self.map_viz = MapVisualizer(cfg)
         print("\n✅ Controlador tilt+cámara inicializado\n")
     
-    def run_test(self, initial_tilt_deg: float, duration_s: float = 120.0):
+    def run_test(self, target_tilt_deg: float, duration_s: float = 120.0):
         """
-        Ejecuta una prueba de tilt con corrección automática
+        Ejecuta una prueba de tilt sin corrección automática
         
         Args:
-            initial_tilt_deg: Ángulo inicial del espejo (°)
+            target_tilt_deg: Ángulo objetivo del espejo (°)
             duration_s: Duración de la prueba (s)
         """
         print("=" * 80)
         print(f"🧪 TEST DE TILT Y CÁMARA (SIN MOVIMIENTO)")
-        print(f"   Tilt inicial: {initial_tilt_deg:.1f}°")
+        print(f"   Tilt objetivo: {target_tilt_deg:.1f}°")
         print(f"   Duración: {duration_s}s")
-        print(f"   Corrección automática: {'✅ ON' if self.cfg.enable_ray_correction else '❌ OFF'}")
+        print("   Corrección automática: ❌ OFF (solo monitoreo)")
         print("=" * 80)
         print("\n📌 Coloca el helióstato en posición fija apuntando a la torre")
         print("Presiona Ctrl+C para detener\n")
         
         t_start = time.time()
-        tilt_target = initial_tilt_deg
         
         try:
             while (time.time() - t_start) < duration_s:
                 # Leer cámara
                 ray_info = self.camera.get_ray_info()
                 
-                # Actualizar tilt objetivo si hay corrección automática
-                if self.cfg.enable_ray_correction and ray_info['detected'] and not ray_info['centered']:
-                    offset_y = ray_info['offset_y']
-                    offset_magnitude = abs(offset_y)
-                    
-                    # Corrección adaptativa: más rápido si está lejos, más lento si está cerca
-                    if offset_magnitude > self.cfg.slow_threshold_px:
-                        factor = self.cfg.correction_speed_fast
-                    else:
-                        factor = self.cfg.correction_speed_slow
-                    
-                    # Solo corregir si supera el umbral
-                    if offset_magnitude > self.cfg.ray_vertical_threshold:
-                        tilt_correction = -offset_y * factor
-                        tilt_target += tilt_correction
-                        tilt_target = max(self.cfg.tilt_min_deg, 
-                                        min(self.cfg.tilt_max_deg, tilt_target))
-                
-                # Aplicar tilt
-                self.tilt.set_tilt_deg(tilt_target)
+                # Aplicar tilt fijo (sin corrección automática)
+                self.tilt.set_tilt_deg(target_tilt_deg)
                 self.tilt.update()
                 
                 # Telemetría
@@ -598,17 +591,17 @@ class TiltCameraController:
                 
                 # Actualizar mapa
                 if ray_info['detected'] and current_tilt is not None:
-                    self.map_viz.update(ray_info, current_tilt, tilt_target)
+                    self.map_viz.update(ray_info, current_tilt, target_tilt_deg)
                 
                 if ray_info['detected']:
-                    status = "✅ CENTRADO" if ray_info['centered'] else "⚠️ Ajustando"
+                    status = "✅ CENTRADO" if ray_info['centered'] else "⚠️ Descentrado"
                     print(f"\n{status} | "
                           f"Pos: ({ray_info['x_m']:.2f}, {ray_info['y_m']:.2f})m | "
-                          f"Tilt: {current_tilt:.1f}°→{tilt_target:.1f}° | "
+                          f"Tilt: {current_tilt:.1f}° (obj: {target_tilt_deg:.1f}°) | "
                           f"Brillo: {ray_info['brightness']:.0f} | "
                           f"Offset Y: {ray_info['offset_y']:+.1f}px")
                 else:
-                    print(f"\n❌ SIN PATRÓN | Tilt: {current_tilt:.1f}° (manteniendo {tilt_target:.1f}°)")
+                    print(f"\n❌ SIN PATRÓN | Tilt: {current_tilt:.1f}° (obj: {target_tilt_deg:.1f}°)")
                 
                 time.sleep(0.05)
         
@@ -627,20 +620,11 @@ def main():
     
     # ===== CONFIGURA AQUÍ TU PRUEBA =====
     
-    # Tilt inicial del espejo
-    initial_tilt = 30.0  # grados
+    # Tilt objetivo del espejo (fijo, sin corrección automática)
+    target_tilt = 30.0  # grados
     
-    # Configuración de corrección automática
-    cfg.enable_ray_correction = True            # True = corrección automática ON
-    cfg.tilt_correction_factor = 0.08           # Ajusta sensibilidad (menor = más suave)
-    cfg.ray_threshold_px = 5.0                  # Umbral para activar corrección
-    cfg.ray_vertical_threshold = 3.0            # Umbral mínimo de error vertical
-    cfg.brightness_threshold = 200              # Umbral brillo para considerar "centrado"
-    
-    # Control adaptativo (corrección más rápida si está lejos)
-    cfg.correction_speed_fast = 0.10            # Velocidad cuando está lejos (>20px)
-    cfg.correction_speed_slow = 0.03            # Velocidad cuando está cerca (<20px)
-    cfg.slow_threshold_px = 20.0
+    # Umbral brillo para considerar "centrado"
+    cfg.brightness_threshold = 200
     
     # Duración de la prueba
     test_duration = 120.0  # segundos (2 minutos)
@@ -650,10 +634,11 @@ def main():
     print("\n" + "="*80)
     print("  TEST DE LABORATORIO - SOLO TILT Y CÁMARA")
     print("  (No requiere ruedas ni movimiento)")
+    print("  (Sin corrección automática - solo monitoreo)")
     print("="*80 + "\n")
     
     controller = TiltCameraController(cfg)
-    controller.run_test(initial_tilt, duration_s=test_duration)
+    controller.run_test(target_tilt, duration_s=test_duration)
 
 if __name__ == "__main__":
     main()
