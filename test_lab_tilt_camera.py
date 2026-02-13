@@ -480,32 +480,31 @@ class MapVisualizer:
     
     def update(self, ray_info: Dict, current_tilt: float, target_tilt: float):
         """Actualiza la visualización con nueva información"""
-        try:
-            # Actualizar posición del helióstato
-            x, y = ray_info['x_m'], ray_info['y_m']
-            psi = ray_info['psi']
-            
-            self.helio_body.set_center((x, y))
-            
-            # Actualizar flecha de orientación
-            if self.helio_arrow:
-                self.helio_arrow.remove()
-            arrow_len = 0.8
-            dx = arrow_len * math.cos(psi)
-            dy = arrow_len * math.sin(psi)
-            self.helio_arrow = FancyArrow(x, y, dx, dy, width=0.15, 
-                                         color='darkgreen', alpha=0.8, zorder=5)
-            self.ax_map.add_patch(self.helio_arrow)
-            
-            # Etiqueta del helióstato
-            self.helio_label.set_position((x, y - 0.6))
-            self.helio_label.set_text(f'Helióstato\n({x:.2f}, {y:.2f})')
-            
-            # Panel de información
-            status_icon = "✅" if ray_info['centered'] else "⚠️"
-            detection_icon = "🎯" if ray_info['detected'] else "❌"
-            
-            info = f"""
+        # Actualizar posición del helióstato
+        x, y = ray_info['x_m'], ray_info['y_m']
+        psi = ray_info['psi']
+        
+        self.helio_body.set_center((x, y))
+        
+        # Actualizar flecha de orientación
+        if self.helio_arrow:
+            self.helio_arrow.remove()
+        arrow_len = 0.8
+        dx = arrow_len * math.cos(psi)
+        dy = arrow_len * math.sin(psi)
+        self.helio_arrow = FancyArrow(x, y, dx, dy, width=0.15, 
+                                     color='darkgreen', alpha=0.8, zorder=5)
+        self.ax_map.add_patch(self.helio_arrow)
+        
+        # Etiqueta del helióstato
+        self.helio_label.set_position((x, y - 0.6))
+        self.helio_label.set_text(f'Helióstato\n({x:.2f}, {y:.2f})')
+        
+        # Panel de información
+        status_icon = "✅" if ray_info['centered'] else "⚠️"
+        detection_icon = "🎯" if ray_info['detected'] else "❌"
+        
+        info = f"""
 ╔════════════════════════════════════════╗
 ║  ESTADO DEL SISTEMA                    ║
 ╚════════════════════════════════════════╝
@@ -534,31 +533,29 @@ Error:       {target_tilt - current_tilt:+6.1f}°
 Brillo:      {ray_info['brightness']:6.0f}
 Offset Y:    {ray_info['offset_y']:+6.1f} px
 Offset X:    {ray_info['offset_x']:+6.1f} px
-            """
+        """
+        
+        self.info_text.set_text(info.strip())
+        
+        # Actualizar imagen de cámara
+        if 'frame' in ray_info and ray_info['frame'] is not None:
+            frame = ray_info['frame']
+            # Convertir BGR a RGB para matplotlib
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                frame_rgb = frame[:, :, ::-1]  # BGR -> RGB
+            else:
+                frame_rgb = frame
             
-            self.info_text.set_text(info.strip())
+            self.camera_image.set_data(frame_rgb)
             
-            # Actualizar imagen de cámara
-            if 'frame' in ray_info and ray_info['frame'] is not None:
-                frame = ray_info['frame']
-                # Convertir BGR a RGB para matplotlib
-                if len(frame.shape) == 3 and frame.shape[2] == 3:
-                    frame_rgb = frame[:, :, ::-1]  # BGR -> RGB
-                else:
-                    frame_rgb = frame
-                
-                self.camera_image.set_data(frame_rgb)
-                
-                # Remover texto placeholder si existe
-                if hasattr(self, 'camera_text') and self.camera_text:
-                    self.camera_text.set_visible(False)
-            
-            # Redibujar
-            self.fig.canvas.draw()
-            self.fig.canvas.flush_events()
-            plt.pause(0.001)
-        except Exception as e:
-            print(f"\n⚠️ Error actualizando visualización: {e}")
+            # Remover texto placeholder si existe
+            if hasattr(self, 'camera_text') and self.camera_text:
+                self.camera_text.set_visible(False)
+        
+        # Redibujar
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
     
     def close(self):
         plt.close(self.fig)
