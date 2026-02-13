@@ -390,7 +390,8 @@ class CameraDetection:
                 Y_cm = distance_h_cm * math.cos(yaw_err_rad)
                 result['x_m'] = X_cm / 100.0
                 result['y_m'] = Y_cm / 100.0
-             (entre las 4 marcas verdes)
+            
+            # Centro del patrón (entre las 4 marcas verdes)
             cx, cy = np.mean(pts, axis=0).astype(int)
             gray = self.cv2.cvtColor(frame_u, self.cv2.COLOR_BGR2GRAY)
             
@@ -429,7 +430,6 @@ class CameraDetection:
             # Línea del offset (del centro al rayo)
             if not result['centered']:
                 self.cv2.line(frame_u, (cx, cy), bright_pt, (255, 255, 0), 2)
-            self.cv2.circle(frame_u, bright_pt, 5, (0, 255, 0), -1)  # Punto brillante verde
             
             result['detected'] = True
         
