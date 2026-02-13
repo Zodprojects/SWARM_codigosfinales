@@ -464,7 +464,11 @@ class MapVisualizer:
         
         plt.tight_layout()
         plt.show(block=False)
-        plt.pause(0.001)
+        
+        # Dibujar inicial
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.1)
     
     def update(self, ray_info: Dict, current_tilt: float, target_tilt: float):
         """Actualiza la visualización con nueva información"""
@@ -538,6 +542,14 @@ Offset X:    {ray_info['offset_x']:+6.1f} px
                 self.camera_image = self.ax_camera.imshow(frame_rgb)
             else:
                 self.camera_image.set_data(frame_rgb)
+        else:
+            # Mostrar mensaje si no hay frame
+            if self.camera_image is None:
+                placeholder = np.zeros((480, 640, 3), dtype=np.uint8)
+                self.camera_image = self.ax_camera.imshow(placeholder)
+                self.ax_camera.text(0.5, 0.5, 'Esperando imagen...', 
+                                   transform=self.ax_camera.transAxes,
+                                   ha='center', va='center', fontsize=16, color='white')
         
         # Redibujar
         self.fig.canvas.draw()
@@ -589,8 +601,8 @@ class TiltCameraController:
                 # Telemetría
                 current_tilt = self.tilt.get_current_tilt()
                 
-                # Actualizar mapa
-                if ray_info['detected'] and current_tilt is not None:
+                # Actualizar mapa (siempre, aunque no haya detección)
+                if current_tilt is not None:
                     self.map_viz.update(ray_info, current_tilt, target_tilt_deg)
                 
                 if ray_info['detected']:
