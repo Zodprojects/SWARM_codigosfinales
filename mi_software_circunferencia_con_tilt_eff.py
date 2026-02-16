@@ -39,6 +39,11 @@ class Config:
     sigma_sun_mrad: float = 4.65
     sigma_track_mrad: float = 1.5
     sigma_slope_mrad: float = 1.5
+    # Pérdidas ópticas adicionales (estilo SolarPILOT, sin sombras/bloqueos)
+    rho_mirror: float = 0.95        # reflectividad del espejo
+    f_soiling: float = 0.95         # factor de ensuciamiento (soiling)
+    f_refl: float = 0.97            # ratio área reflectante (pérdida por estructura)
+    f_opt: float = 1.0              # degradación óptica adicional (envejecimiento, etc.)
 
 @dataclass
 class Command:
@@ -86,11 +91,21 @@ def compute_efficiency_components(s: Vec3, n: Vec3, p: Vec3, r: Vec3, cfg: Confi
     sigma_ang = math.sqrt(cfg.sigma_sun_mrad**2 + cfg.sigma_track_mrad**2 + cfg.sigma_slope_mrad**2) * 1e-3
     sigma_R = max(EPS_DEN, dist * sigma_ang)
     eta_int = 1.0 - math.exp(-(cfg.receiver_radius**2) / (2.0 * sigma_R**2))
-    eta_total = eta_cos * eta_att * eta_int
+    # Pérdidas ópticas adicionales estilo SolarPILOT (sin sombras/bloqueos)
+    rho_mirror = cfg.rho_mirror
+    f_soiling = cfg.f_soiling
+    f_refl = cfg.f_refl
+    f_opt = cfg.f_opt
+    # Eficiencia total incluyendo todos los factores
+    eta_total = eta_cos * eta_att * eta_int * rho_mirror * f_soiling * f_refl * f_opt
     return {
         "eta_cos": eta_cos,
         "eta_att": eta_att,
         "eta_int": eta_int,
+        "rho_mirror": rho_mirror,
+        "f_soiling": f_soiling,
+        "f_refl": f_refl,
+        "f_opt": f_opt,
         "eta_total": eta_total,
         "dist": dist,
     }
@@ -826,11 +841,13 @@ def main():
                     ]
                     if effA is not None:
                         lines.append(
-                            f"eta_opt={effA['eta_total']:.3f} (cos={effA['eta_cos']:.3f} att={effA['eta_att']:.3f} int={effA['eta_int']:.3f})"
+                            f"eta_opt={effA['eta_total']:.3f} (cos={effA['eta_cos']:.3f} att={effA['eta_att']:.3f} int={effA['eta_int']:.3f} "
+                            f"rho={effA['rho_mirror']:.3f} soil={effA['f_soiling']:.3f} refl={effA['f_refl']:.3f} opt={effA['f_opt']:.3f})"
                         )
                     if effB is not None:
                         lines.append(
-                            f"eta_circ={effB['eta_total']:.3f} (cos={effB['eta_cos']:.3f} att={effB['eta_att']:.3f} int={effB['eta_int']:.3f})"
+                            f"eta_circ={effB['eta_total']:.3f} (cos={effB['eta_cos']:.3f} att={effB['eta_att']:.3f} int={effB['eta_int']:.3f} "
+                            f"rho={effB['rho_mirror']:.3f} soil={effB['f_soiling']:.3f} refl={effB['f_refl']:.3f} opt={effB['f_opt']:.3f})"
                         )
                     txta.set_text("\n".join(lines))
 
