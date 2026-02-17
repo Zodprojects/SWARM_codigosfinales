@@ -4,7 +4,7 @@ CONTROL COMPLETO DE HELIÓSTATO - TILT, CÁMARA Y ODRIVE
 
 Incluye:
 - Control de inclinación del espejo (actuador tilt + MPU6050)
-- Detección visual del rayo (cámara + patrón verde)
+- Detección visual del rayo (cámara + patrón blanco)
 - Control de movimiento (ODrive + ruedas)
 - Odometría por encoders Hall (comparación con visión)
 - Menú interactivo
@@ -801,18 +801,78 @@ class TiltCameraController:
             self.map_viz.close()
             print("✅ Test finalizado")
     
+    def wait_for_pattern_detection(self, timeout_s: float = 60.0) -> bool:
+        """Espera hasta que se detecte el patrón de la torre"""
+        print("\n" + "="*80)
+        print("⏳ ESPERANDO DETECCION DEL PATRON DE LA TORRE...")
+        print("="*80)
+        print("Posiciona el heliostato para que la camara vea el patron blanco (4 esquinas)")
+        print("Presiona Ctrl+C para cancelar\n")
+        
+        t_start = time.time()
+        detected = False
+        
+        try:
+            while (time.time() - t_start) < timeout_s:
+                ray_info = self.camera.get_ray_info()
+                
+                # Actualizar visualización
+                self.tilt.update()
+                current_tilt = self.tilt.get_current_tilt()
+                if current_tilt is not None:
+                    self.map_viz.update(ray_info, current_tilt, current_tilt, None)
+                
+                if ray_info['detected']:
+                    print(f"\n✅ PATRON DETECTADO!")
+                    print(f"   Posicion estimada: X={ray_info['x_m']:.2f}m, Y={ray_info['y_m']:.2f}m")
+                    print(f"   Orientacion: {math.degrees(ray_info['psi']):.1f} grados")
+                    detected = True
+                    break
+                else:
+                    print(f"\r⏳ Buscando patron... (timeout en {timeout_s - (time.time() - t_start):.0f}s)", 
+                          end="", flush=True)
+                
+                time.sleep(0.1)
+            
+            if not detected:
+                print("\n\nXX Timeout: No se detecto el patron")
+                return False
+            
+            return True
+            
+        except KeyboardInterrupt:
+            print("\n\nDeteccion cancelada por usuario")
+            return False
+    
     def move_to_position(self, target_x: float, target_y: float, target_tilt: float, 
                          timeout_s: float = 30.0, position_tolerance: float = 0.1):
         if not self.odrive:
             print("XX ODrive no esta habilitado")
             return False
         
-        print("=" * 80)
+        # PASO 1: Esperar detección del patrón
+        if not self.wait_for_pattern_detection(timeout_s=60.0):
+            print("\nXX No se puede iniciar movimiento sin deteccion del patron")
+            return False
+        
+        # PASO 2: Pedir confirmación del usuario
+        print("\n" + "="*80)
         print(f"MOVIMIENTO A POSICION XY")
         print(f"   Objetivo: X={target_x:.2f}m, Y={target_y:.2f}m")
         print(f"   Tilt objetivo: {target_tilt:.1f} grados")
-        print("=" * 80)
-        print("\nPresiona Ctrl+C para detener\n")
+        print("="*80)
+        
+        try:
+            confirmar = input("\n¿Iniciar movimiento? (s/n): ").strip().lower()
+            if confirmar not in ['s', 'si', 'yes', 'y']:
+                print("\nMovimiento cancelado por usuario")
+                return False
+        except KeyboardInterrupt:
+            print("\n\nMovimiento cancelado por usuario")
+            return False
+        
+        print("\n▶️ INICIANDO MOVIMIENTO...")
+        print("Presiona Ctrl+C para detener\n")
         
         t_start = time.time()
         arrived = False
@@ -877,11 +937,28 @@ class TiltCameraController:
             print("XX ODrive no esta habilitado")
             return
         
-        print("=" * 80)
+        # PASO 1: Esperar detección del patrón
+        if not self.wait_for_pattern_detection(timeout_s=60.0):
+            print("\nXX No se puede iniciar movimiento sin deteccion del patron")
+            return
+        
+        # PASO 2: Pedir confirmación del usuario
+        print("\n" + "="*80)
         print("TEST DE MOVIMIENTO ODRIVE")
         print(f"   Duracion: {duration_s}s")
-        print("=" * 80)
-        print("\nPresiona Ctrl+C para detener\n")
+        print("="*80)
+        
+        try:
+            confirmar = input("\n¿Iniciar secuencia de movimiento? (s/n): ").strip().lower()
+            if confirmar not in ['s', 'si', 'yes', 'y']:
+                print("\nTest cancelado por usuario")
+                return
+        except KeyboardInterrupt:
+            print("\n\nTest cancelado por usuario")
+            return
+        
+        print("\n▶️ INICIANDO SECUENCIA DE MOVIMIENTO...")
+        print("Presiona Ctrl+C para detener\n")
         
         t_start = time.time()
         
