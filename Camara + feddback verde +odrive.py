@@ -1,0 +1,1066 @@
+# -*- coding: utf-8 -*-
+"""
+CONTROL COMPLETO DE HELIÓSTATO - TILT, CÁMARA Y ODRIVE
+
+Incluye:
+- Control de inclinación del espejo (actuador tilt + MPU6050)
+- Detección visual del rayo (cámara + patrón verde)
+- Control de movimiento (ODrive + ruedas)
+- Odometría por encoders Hall (comparación con visión)
+- Menú interactivo
+
+Uso:
+1. Ejecutar: python heliostato_control_completo.py
+2. Seguir el menú interactivo para elegir modo
+"""
+
+from __future__ import annotations
+import math, time, struct, sys
+from dataclasses import dataclass
+from typing import Optional, Dict
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrow, Circle
+
+# ======================= CONFIGURACIÓN =======================
+@dataclass
+class Config:
+    # Torre
+    tower_height: float = 3.0
+    
+    # CAN
+    can_channel: str = "can0"
+    can_bitrate: int = 500_000
+    
+    # ODrive (CANSimple)
+    node_right: int = 1
+    node_left: int = 2
+    wheel_radius: float = 0.08
+    gear_ratio: float = 1.0
+    wheelbase: float = 0.30
+    vmax_rev_s_clip: float = 20.0
+    sign_R: float = +1.0
+    sign_L: float = +1.0
+    max_linear_speed: float = 0.5
+    max_angular_speed: float = 1.0
+    
+    # Actuador tilt
+    ACT_CAN_ID_CMD: int = 0x321
+    tilt_min_deg: float = 0.0
+    tilt_max_deg: float = 90.0
+    
+    # PID Tilt
+    Kp: float = 1.0
+    Ki: float = 0.0
+    Kd: float = 0.0
+    I_clamp: float = 0.6
+    deadband_deg: float = 1.0
+    PWM_MAX: int = 255
+    PWM_MIN_EFF: int = 85
+    PWM_SLEW: int = 25
+    pwm_per_degree: float = 12.0
+    can_send_interval: float = 0.1
+    telemetry_hz: float = 5.0
+    
+    # MPU6050
+    mpu_bus: int = 1
+    mpu_addr: int = 0x68
+    mpu_dt: float = 0.02
+    mpu_alpha: float = 0.98
+    
+    # Detección de rayo
+    brightness_threshold: int = 200
+
+# ======================= UTILIDADES =======================
+def wrap_angle(a):
+    while a <= -math.pi: a += 2*math.pi
+    while a > math.pi: a -= 2*math.pi
+    return a
+
+# ======================= ODOMETRÍA POR ENCODERS =======================
+class WheelOdometry:
+    """Calcula pose (x, y, psi) integrando velocidades de las ruedas"""
+    def __init__(self, cfg: Config, initial_x: float = 0.0, initial_y: float = 0.0, initial_psi: float = 0.0):
+        self.cfg = cfg
+        self.x = initial_x
+        self.y = initial_y
+        self.psi = initial_psi
+        self.last_update_time = time.time()
+        print("✅ Odometría por encoders inicializada")
+    
+    def reset(self, x: float = 0.0, y: float = 0.0, psi: float = 0.0):
+        self.x = x
+        self.y = y
+        self.psi = psi
+        self.last_update_time = time.time()
+    
+    def update(self, vR: float, vL: float):
+        current_time = time.time()
+        dt = current_time - self.last_update_time
+        
+        if dt > 0.5 or dt <= 0:
+            self.last_update_time = current_time
+            return
+        
+        v = (vR + vL) / 2.0
+        omega = (vR - vL) / self.cfg.wheelbase
+        
+        self.x += v * math.sin(self.psi) * dt
+        self.y += v * math.cos(self.psi) * dt
+        self.psi = wrap_angle(self.psi + omega * dt)
+        
+        self.last_update_time = current_time
+    
+    def get_pose(self) -> tuple:
+        return self.x, self.y, self.psi
+
+# ======================= CAN MANAGER =======================
+class CanManager:
+    def __init__(self, cfg: Config):
+        import can
+        self.bus = can.interface.Bus(channel=cfg.can_channel, bustype="socketcan")
+        print("✅ CAN inicializado")
+    
+    def shutdown(self):
+        try:
+            self.bus.shutdown()
+        except:
+            pass
+
+# ======================= ODRIVE POR CANSIMPLE =======================
+SET_AXIS_STATE  = 0x07
+SET_INPUT_VEL   = 0x0D
+GET_ENCODER_ESTIMATES = 0x09
+AXIS_IDLE       = 1
+AXIS_CLOSEDLOOP = 8
+
+class ODriveCanDriver:
+    def __init__(self, cfg: Config, can_mgr: CanManager):
+        self.cfg = cfg
+        self.bus = can_mgr.bus
+        self._enabled = False
+        self._encoder_pos_right = 0.0
+        self._encoder_pos_left = 0.0
+        self._encoder_vel_right = 0.0
+        self._encoder_vel_left = 0.0
+        self._last_encoder_update = time.time()
+        print("✅ ODrive inicializado")
+    
+    def _mk_msg(self, arb_id, data=b""):
+        import can
+        return can.Message(arbitration_id=arb_id, is_extended_id=False, data=data)
+    
+    def set_axis_state(self, node_id: int, state: int):
+        msg_id = (node_id << 5) | SET_AXIS_STATE
+        self.bus.send(self._mk_msg(msg_id, struct.pack("<I", state)))
+    
+    def start(self):
+        print("▶️ Iniciando ODrive...")
+        for nid in (self.cfg.node_right, self.cfg.node_left):
+            self.set_axis_state(nid, AXIS_CLOSEDLOOP)
+            time.sleep(0.01)
+        self._enabled = True
+        print("✅ ODrive en modo closed-loop")
+    
+    def stop(self):
+        try:
+            self.send_wheel_speeds(0.0, 0.0)
+        except:
+            pass
+        time.sleep(0.02)
+        for nid in (self.cfg.node_right, self.cfg.node_left):
+            try:
+                self.set_axis_state(nid, AXIS_IDLE)
+            except:
+                pass
+        self._enabled = False
+        print("🛑 ODrive detenido")
+    
+    def _ms_to_revs(self, v_ms: float) -> float:
+        return (v_ms / (2.0 * math.pi * self.cfg.wheel_radius)) * self.cfg.gear_ratio
+    
+    def send_wheel_speeds(self, vR_ms: float, vL_ms: float):
+        if not self._enabled:
+            return
+        
+        vmax = self.cfg.vmax_rev_s_clip
+        vR_rev = max(-vmax, min(vmax, self.cfg.sign_R * self._ms_to_revs(vR_ms)))
+        vL_rev = max(-vmax, min(vmax, self.cfg.sign_L * self._ms_to_revs(vL_ms)))
+        
+        msg_id_R = (self.cfg.node_right << 5) | SET_INPUT_VEL
+        msg_id_L = (self.cfg.node_left  << 5) | SET_INPUT_VEL
+        
+        self.bus.send(self._mk_msg(msg_id_R, struct.pack("<ff", float(vR_rev), 0.0)))
+        self.bus.send(self._mk_msg(msg_id_L, struct.pack("<ff", float(vL_rev), 0.0)))
+    
+    def send_body_velocity(self, v_forward: float, omega: float):
+        half_base = self.cfg.wheelbase / 2.0
+        vR = v_forward + omega * half_base
+        vL = v_forward - omega * half_base
+        
+        vR = max(-self.cfg.max_linear_speed, min(self.cfg.max_linear_speed, vR))
+        vL = max(-self.cfg.max_linear_speed, min(self.cfg.max_linear_speed, vL))
+        
+        self.send_wheel_speeds(vR, vL)
+    
+    def move_to_xy(self, target_x: float, target_y: float, current_x: float, 
+                   current_y: float, current_psi: float, 
+                   kp_linear: float = 0.3, kp_angular: float = 1.5,
+                   tolerance_m: float = 0.1) -> bool:
+        dx = target_x - current_x
+        dy = target_y - current_y
+        distance = math.sqrt(dx*dx + dy*dy)
+        
+        if distance < tolerance_m:
+            self.send_wheel_speeds(0.0, 0.0)
+            return True
+        
+        target_angle = math.atan2(dx, dy)
+        angle_error = wrap_angle(target_angle - current_psi)
+        
+        v_forward = kp_linear * distance
+        omega = kp_angular * angle_error
+        
+        v_forward = max(-self.cfg.max_linear_speed, 
+                       min(self.cfg.max_linear_speed, v_forward))
+        omega = max(-self.cfg.max_angular_speed, 
+                   min(self.cfg.max_angular_speed, omega))
+        
+        if abs(angle_error) > math.radians(30):
+            v_forward *= 0.3
+        
+        self.send_body_velocity(v_forward, omega)
+        return False
+    
+    def request_encoder_estimates(self):
+        msg_id_R = (self.cfg.node_right << 5) | GET_ENCODER_ESTIMATES
+        self.bus.send(self._mk_msg(msg_id_R))
+        
+        msg_id_L = (self.cfg.node_left << 5) | GET_ENCODER_ESTIMATES
+        self.bus.send(self._mk_msg(msg_id_L))
+    
+    def read_encoder_messages(self, timeout=0.01):
+        t_start = time.time()
+        while (time.time() - t_start) < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.005)
+                if msg is None:
+                    continue
+                
+                node_id = (msg.arbitration_id >> 5)
+                cmd_id = msg.arbitration_id & 0x1F
+                
+                if cmd_id == GET_ENCODER_ESTIMATES and len(msg.data) >= 8:
+                    pos, vel = struct.unpack("<ff", msg.data[:8])
+                    
+                    if node_id == self.cfg.node_right:
+                        self._encoder_pos_right = pos
+                        self._encoder_vel_right = vel
+                    elif node_id == self.cfg.node_left:
+                        self._encoder_pos_left = pos
+                        self._encoder_vel_left = vel
+                    
+                    self._last_encoder_update = time.time()
+            except:
+                pass
+    
+    def get_wheel_velocities(self) -> tuple:
+        vR = self._encoder_vel_right * (2.0 * math.pi * self.cfg.wheel_radius) / self.cfg.gear_ratio
+        vL = self._encoder_vel_left * (2.0 * math.pi * self.cfg.wheel_radius) / self.cfg.gear_ratio
+        return vR * self.cfg.sign_R, vL * self.cfg.sign_L
+    
+    def get_encoder_positions(self) -> tuple:
+        return self._encoder_pos_right, self._encoder_pos_left
+
+# ======================= MPU6050 =======================
+PWR_MGMT_1 = 0x6B
+ACCEL_XOUT_H = 0x3B
+GYRO_XOUT_H = 0x43
+ACCEL_SCALE = 16384.0
+GYRO_SCALE = 131.0
+
+class MPU6050:
+    def __init__(self, cfg: Config):
+        from smbus2 import SMBus
+        self.bus = SMBus(cfg.mpu_bus)
+        self.addr = cfg.mpu_addr
+        self.dt = cfg.mpu_dt
+        self.alpha = cfg.mpu_alpha
+        
+        self.bus.write_byte_data(self.addr, PWR_MGMT_1, 0x00)
+        time.sleep(0.05)
+        self.gyro_bias = self._calibrate_gyro()
+        ax, ay, az, *_ = self._read_accel_gyro()
+        self.pitch, self.roll = self._accel_to_angles(ax, ay, az)
+        print(f"✅ MPU6050 inicializado (bias: x={self.gyro_bias['x']:.2f})")
+    
+    def _read_word(self, reg):
+        hi = self.bus.read_byte_data(self.addr, reg)
+        lo = self.bus.read_byte_data(self.addr, reg + 1)
+        val = (hi << 8) | lo
+        return -((65535 - val) + 1) if val >= 0x8000 else val
+    
+    def _read_accel_gyro(self):
+        ax = self._read_word(ACCEL_XOUT_H) / ACCEL_SCALE
+        ay = self._read_word(ACCEL_XOUT_H + 2) / ACCEL_SCALE
+        az = self._read_word(ACCEL_XOUT_H + 4) / ACCEL_SCALE
+        gx = self._read_word(GYRO_XOUT_H) / GYRO_SCALE
+        gy = self._read_word(GYRO_XOUT_H + 2) / GYRO_SCALE
+        gz = self._read_word(GYRO_XOUT_H + 4) / GYRO_SCALE
+        return ax, ay, az, gx, gy, gz
+    
+    def _accel_to_angles(self, ax, ay, az):
+        roll = math.degrees(math.atan2(ay, az))
+        pitch = math.degrees(math.atan2(-ax, math.sqrt(ay*ay + az*az)))
+        return pitch, roll
+    
+    def _calibrate_gyro(self, samples=200):
+        print("🔄 Calibrando giroscopio MPU6050...")
+        sx = sy = sz = 0.0
+        for _ in range(samples):
+            _, _, _, gx, gy, gz = self._read_accel_gyro()
+            sx += gx; sy += gy; sz += gz
+            time.sleep(0.002)
+        return {'x': sx/samples, 'y': sy/samples, 'z': sz/samples}
+    
+    def read_pitch_roll(self):
+        ax, ay, az, gx, gy, gz = self._read_accel_gyro()
+        gx -= self.gyro_bias['x']
+        gy -= self.gyro_bias['y']
+        
+        pitch_gyro = self.pitch + gy * self.dt
+        roll_gyro = self.roll + gx * self.dt
+        pitch_acc, roll_acc = self._accel_to_angles(ax, ay, az)
+        
+        self.pitch = self.alpha * pitch_gyro + (1 - self.alpha) * pitch_acc
+        self.roll = self.alpha * roll_gyro + (1 - self.alpha) * roll_acc
+        return self.pitch, self.roll
+
+# ======================= TILT ACTUATOR =======================
+DIR_EXTIENDE = 0
+DIR_RETRAE = 1
+
+class TiltActuator:
+    def __init__(self, cfg: Config, can_mgr: CanManager, mpu: MPU6050):
+        self.cfg = cfg
+        self.bus = can_mgr.bus
+        self.mpu = mpu
+        self._target_deg = None
+        self._dt = cfg.mpu_dt
+        self._ei = 0.0
+        self._e_prev = 0.0
+        self._pwm_prev = 0
+        self._last_can_send = 0.0
+        self._last_telemetry = 0.0
+        print("✅ Actuador tilt inicializado")
+    
+    def set_tilt_deg(self, tilt_deg: float):
+        self._target_deg = max(self.cfg.tilt_min_deg, 
+                              min(self.cfg.tilt_max_deg, float(tilt_deg)))
+    
+    def get_current_tilt(self) -> Optional[float]:
+        pitch, roll = self.mpu.read_pitch_roll()
+        if roll is not None:
+            return roll * 1.0
+        return None
+    
+    def update(self):
+        if self._target_deg is None:
+            return
+        
+        pitch, roll = self.mpu.read_pitch_roll()
+        if pitch is None or roll is None:
+            return
+        
+        theta_med = roll * 1.0
+        if theta_med < self.cfg.tilt_min_deg or theta_med > self.cfg.tilt_max_deg:
+            self._send(0, 0)
+            return
+        
+        e = self._target_deg - theta_med
+        u = self._pid(e, self._dt)
+        pwm = self._pwm_from_u(u)
+        
+        if pwm == 0:
+            self._send(0, 0)
+        else:
+            direccion = DIR_EXTIENDE if u > 0 else DIR_RETRAE
+            now = time.perf_counter()
+            if now - self._last_can_send >= self.cfg.can_send_interval:
+                try:
+                    self._send(direccion, pwm)
+                    self._last_can_send = now
+                except:
+                    pass
+        
+        now = time.perf_counter()
+        if now - self._last_telemetry >= (1.0 / max(1.0, self.cfg.telemetry_hz)):
+            dirstr = "STOP" if pwm == 0 else ("EXTEND" if direccion == 0 else "RETRACT")
+            line = f"Tilt: Ref={self._target_deg:5.1f}° Act={theta_med:5.1f}° Err={e:5.1f}° PWM={pwm:3d} {dirstr}"
+            sys.stdout.write("\r" + line + " " * 10)
+            sys.stdout.flush()
+            self._last_telemetry = now
+    
+    def _pid(self, e, dt):
+        self._ei += e * dt
+        self._ei = max(-self.cfg.I_clamp, min(self.cfg.I_clamp, self._ei))
+        de = (e - self._e_prev) / max(1e-3, dt)
+        self._e_prev = e
+        return self.cfg.Kp * e + self.cfg.Ki * self._ei + self.cfg.Kd * de
+    
+    def _pwm_from_u(self, u):
+        mag = abs(u)
+        if mag < self.cfg.deadband_deg:
+            pwm = 0
+        else:
+            pwm = int(self.cfg.PWM_MIN_EFF + self.cfg.pwm_per_degree * mag)
+            pwm = min(self.cfg.PWM_MAX, pwm)
+        dp = max(-self.cfg.PWM_SLEW, min(self.cfg.PWM_SLEW, pwm - self._pwm_prev))
+        pwm = self._pwm_prev + dp
+        self._pwm_prev = pwm
+        return max(0, pwm)
+    
+    def _send(self, direccion: int, pwm: int):
+        import can
+        msg = can.Message(
+            arbitration_id=self.cfg.ACT_CAN_ID_CMD,
+            data=[int(direccion) & 0xFF, int(pwm) & 0xFF],
+            is_extended_id=False
+        )
+        self.bus.send(msg)
+    
+    def stop(self):
+        try:
+            self._send(0, 0)
+        except:
+            pass
+
+# ======================= CÁMARA Y DETECCIÓN =======================
+class CameraDetection:
+    def __init__(self, cfg: Config):
+        import cv2, board, busio, adafruit_bno055
+        from picamera2 import Picamera2
+        
+        self.cv2 = cv2
+        self.cfg = cfg
+        
+        # Calibración cámara
+        self.camera_matrix = np.array([[1.82798542e+03, 0.0, 5.72342464e+02],
+                                       [0.0, 1.82504450e+03, 3.62602479e+02],
+                                       [0.0, 0.0, 1.0]], dtype=np.float32)
+        self.dist_coeffs = np.array([[4.95174274e-03, 2.65701920e+00, -1.43227501e-03,
+                                     -1.14715430e-02, -1.37391077e+01]], dtype=np.float32)
+        
+        # BNO055 para localización
+        i2c = busio.I2C(board.SCL, board.SDA)
+        self.sensor = adafruit_bno055.BNO055_I2C(i2c, address=0x28)
+        input("📍 Coloca el robot mirando a la TORRE y pulsa ENTER...")
+        self.yaw_ref_deg = self.sensor.euler[0] or 0.0
+        print(f"✅ Referencia yaw: {self.yaw_ref_deg:.1f}°")
+        
+        # Cámara
+        self.picam2 = Picamera2()
+        self.picam2.preview_configuration.main.size = (1280, 720)
+        self.picam2.preview_configuration.main.format = "RGB888"
+        self.picam2.preview_configuration.align()
+        self.picam2.configure("preview")
+        self.picam2.start()
+        time.sleep(0.2)
+        
+        # Patrón objetivo
+        self.REAL_WIDTH = 6.0
+        self.REAL_HEIGHT = 10.0
+        self.object_points = np.array([[0, 0, 0],
+                                       [self.REAL_WIDTH, 0, 0],
+                                       [self.REAL_WIDTH, self.REAL_HEIGHT, 0],
+                                       [0, self.REAL_HEIGHT, 0]], dtype=np.float32)
+        
+        print("✅ Cámara inicializada")
+    
+    def _detectar_marcas(self, frame_u):
+        hsv = self.cv2.cvtColor(frame_u, self.cv2.COLOR_BGR2HSV)
+        lower_green = np.array([35, 50, 50])
+        upper_green = np.array([85, 255, 255])
+        mask_green = self.cv2.inRange(hsv, lower_green, upper_green)
+        mask_green = self.cv2.GaussianBlur(mask_green, (5, 5), 0)
+        contours, _ = self.cv2.findContours(mask_green, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        
+        marcas = []
+        for cnt in contours:
+            area = self.cv2.contourArea(cnt)
+            if 30 < area < 1500:
+                M = self.cv2.moments(cnt)
+                if M["m00"] != 0:
+                    marcas.append([int(M["m10"]/M["m00"]), int(M["m01"]/M["m00"])])
+        
+        return np.array(marcas, dtype=np.float32)
+    
+    def _order4(self, pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]
+        rect[3] = pts[np.argmax(diff)]
+        return rect
+    
+    def get_ray_info(self) -> Dict:
+        frame = self.picam2.capture_array()
+        frame_u = self.cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+        marcas = self._detectar_marcas(frame_u)
+        
+        yaw_act = self.sensor.euler[0] or 0.0
+        pitch_deg = self.sensor.euler[2] or 0.0
+        yaw_err = yaw_act - self.yaw_ref_deg
+        yaw_err_rad = math.radians(yaw_err)
+        
+        result = {
+            'detected': False,
+            'centered': False,
+            'offset_y': 0.0,
+            'offset_x': 0.0,
+            'brightness': 0.0,
+            'distance_cm': 0.0,
+            'x_m': 0.0,
+            'y_m': 0.0,
+            'psi': wrap_angle(math.radians(yaw_act)),
+            'yaw_deg': yaw_act,
+            'frame': frame_u
+        }
+        
+        if len(marcas) == 4:
+            pts = self._order4(marcas).astype(np.float32)
+            
+            for (x, y) in pts:
+                self.cv2.circle(frame_u, (int(x), int(y)), 8, (255, 255, 255), -1)
+                self.cv2.circle(frame_u, (int(x), int(y)), 10, (200, 200, 200), 2)
+            
+            ok, rvec, tvec = self.cv2.solvePnP(self.object_points, pts, self.camera_matrix,
+                                               self.dist_coeffs, flags=self.cv2.SOLVEPNP_IPPE_SQUARE)
+            if ok:
+                distance_cm = float(tvec[2][0])
+                result['distance_cm'] = distance_cm
+                
+                distance_h_cm = distance_cm * max(0.0, math.cos(math.radians(pitch_deg)))
+                X_cm = distance_h_cm * math.sin(yaw_err_rad)
+                Y_cm = distance_h_cm * math.cos(yaw_err_rad)
+                result['x_m'] = X_cm / 100.0
+                result['y_m'] = Y_cm / 100.0
+            
+            cx, cy = np.mean(pts, axis=0).astype(int)
+            gray = self.cv2.cvtColor(frame_u, self.cv2.COLOR_BGR2GRAY)
+            
+            masked = np.zeros_like(gray)
+            self.cv2.fillPoly(masked, [pts.astype(np.int32)], 255)
+            masked_gray = self.cv2.bitwise_and(gray, gray, mask=masked)
+            
+            _, maxVal, _, maxLoc = self.cv2.minMaxLoc(masked_gray)
+            bright_pt = maxLoc
+            bright_avg = float(maxVal)
+            result['brightness'] = bright_avg
+            
+            offset_distance = math.sqrt((bright_pt[0] - cx)**2 + (bright_pt[1] - cy)**2)
+            
+            if bright_avg >= self.cfg.brightness_threshold and offset_distance < 15:
+                result['centered'] = True
+            else:
+                result['offset_y'] = bright_pt[1] - cy
+                result['offset_x'] = bright_pt[0] - cx
+            
+            self.cv2.circle(frame_u, (cx, cy), 8, (255, 0, 0), 2)
+            self.cv2.line(frame_u, (cx-15, cy), (cx+15, cy), (255, 0, 0), 2)
+            self.cv2.line(frame_u, (cx, cy-15), (cx, cy+15), (255, 0, 0), 2)
+            
+            self.cv2.circle(frame_u, bright_pt, 12, (0, 255, 255), 2)
+            self.cv2.circle(frame_u, bright_pt, 8, (255, 255, 255), -1)
+            
+            if not result['centered']:
+                self.cv2.line(frame_u, (cx, cy), bright_pt, (255, 255, 0), 2)
+            
+            result['detected'] = True
+        
+        result['frame'] = frame_u
+        return result
+
+# ======================= VISUALIZACIÓN MAPA =======================
+class MapVisualizer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        plt.ion()
+        self.fig = plt.figure(figsize=(18, 7))
+        
+        gs = self.fig.add_gridspec(1, 3, width_ratios=[1.2, 0.8, 1.5])
+        self.ax_map = self.fig.add_subplot(gs[0])
+        self.ax_info = self.fig.add_subplot(gs[1])
+        self.ax_camera = self.fig.add_subplot(gs[2])
+        
+        self.ax_map.set_xlim(-8, 8)
+        self.ax_map.set_ylim(-1, 12)
+        self.ax_map.set_aspect('equal')
+        self.ax_map.grid(True, alpha=0.3)
+        self.ax_map.set_xlabel('X (m) - Este', fontsize=12)
+        self.ax_map.set_ylabel('Y (m) - Norte', fontsize=12)
+        self.ax_map.set_title('Mapa - Vista desde arriba', fontsize=14, fontweight='bold')
+        
+        tower = Circle((0, 0), 0.3, color='red', alpha=0.8, label='Torre')
+        self.ax_map.add_patch(tower)
+        self.ax_map.plot([0], [0], 'rx', markersize=15, markeredgewidth=3)
+        
+        self.helio_body_camera = Circle((0, 0), 0.25, color='green', alpha=0.7, label='Heliostato (Camara+IMU)')
+        self.ax_map.add_patch(self.helio_body_camera)
+        self.helio_arrow_camera = None
+        self.helio_label_camera = self.ax_map.text(0, 0, '', fontsize=9, ha='center', color='darkgreen', weight='bold')
+        
+        self.helio_body_odom = Circle((0, 0), 0.20, color='blue', alpha=0.5, label='Odometria (Encoders)', linestyle='--', fill=False, linewidth=2)
+        self.ax_map.add_patch(self.helio_body_odom)
+        self.helio_arrow_odom = None
+        self.helio_label_odom = self.ax_map.text(0, 0, '', fontsize=8, ha='center', color='blue')
+        
+        self.ax_map.legend(loc='upper right', fontsize=9)
+        
+        self.ax_info.axis('off')
+        self.info_text = self.ax_info.text(0.05, 0.95, 'Inicializando...', fontsize=11, 
+                                           verticalalignment='top', fontfamily='monospace')
+        
+        self.ax_camera.set_title('Deteccion de Rayo', fontsize=14, fontweight='bold')
+        self.ax_camera.axis('off')
+        
+        placeholder = np.ones((480, 640, 3), dtype=np.uint8) * 128
+        self.camera_image = self.ax_camera.imshow(placeholder)
+        self.camera_text = self.ax_camera.text(0.5, 0.5, 'Esperando imagen de camara...', 
+                                               transform=self.ax_camera.transAxes,
+                                               ha='center', va='center', fontsize=14, 
+                                               color='white', weight='bold',
+                                               bbox=dict(boxstyle='round', facecolor='black', alpha=0.7))
+        
+        plt.tight_layout()
+        self.fig.canvas.draw()
+        plt.show(block=False)
+        self.fig.canvas.flush_events()
+        plt.pause(0.1)
+        
+        print("✅ Ventana de visualizacion creada")
+    
+    def update(self, ray_info: Dict, current_tilt: float, target_tilt: float, odom_pose: Optional[tuple] = None):
+        x_cam, y_cam = ray_info['x_m'], ray_info['y_m']
+        psi_cam = ray_info['psi']
+        
+        self.helio_body_camera.set_center((x_cam, y_cam))
+        
+        if self.helio_arrow_camera:
+            self.helio_arrow_camera.remove()
+        arrow_len = 0.8
+        dx = arrow_len * math.cos(psi_cam)
+        dy = arrow_len * math.sin(psi_cam)
+        self.helio_arrow_camera = FancyArrow(x_cam, y_cam, dx, dy, width=0.15, 
+                                     color='darkgreen', alpha=0.8, zorder=5)
+        self.ax_map.add_patch(self.helio_arrow_camera)
+        
+        self.helio_label_camera.set_position((x_cam, y_cam - 0.7))
+        self.helio_label_camera.set_text(f'Cam+IMU\n({x_cam:.2f}, {y_cam:.2f})')
+        
+        diff_str = ""
+        if odom_pose is not None:
+            x_odom, y_odom, psi_odom = odom_pose
+            
+            self.helio_body_odom.set_center((x_odom, y_odom))
+            self.helio_body_odom.set_visible(True)
+            
+            if self.helio_arrow_odom:
+                self.helio_arrow_odom.remove()
+            dx_o = arrow_len * 0.7 * math.cos(psi_odom)
+            dy_o = arrow_len * 0.7 * math.sin(psi_odom)
+            self.helio_arrow_odom = FancyArrow(x_odom, y_odom, dx_o, dy_o, width=0.12, 
+                                         color='blue', alpha=0.6, zorder=4, linestyle='--')
+            self.ax_map.add_patch(self.helio_arrow_odom)
+            
+            self.helio_label_odom.set_position((x_odom, y_odom + 0.7))
+            self.helio_label_odom.set_text(f'Odom\n({x_odom:.2f}, {y_odom:.2f})')
+            self.helio_label_odom.set_visible(True)
+            
+            diff_x = x_cam - x_odom
+            diff_y = y_cam - y_odom
+            diff_dist = math.sqrt(diff_x**2 + diff_y**2)
+            diff_angle = math.degrees(wrap_angle(psi_cam - psi_odom))
+            diff_str = f"\n  COMPARACION SENSORES\n"
+            diff_str += f"Diferencia XY: {diff_dist:6.2f} m\n"
+            diff_str += f"  DeltaX: {diff_x:+6.2f} m\n"
+            diff_str += f"  DeltaY: {diff_y:+6.2f} m\n"
+            diff_str += f"Dif. Angulo:   {diff_angle:+6.1f} grados"
+        else:
+            self.helio_body_odom.set_visible(False)
+            if self.helio_arrow_odom:
+                self.helio_arrow_odom.set_visible(False)
+            self.helio_label_odom.set_visible(False)
+        
+        status_icon = "OK" if ray_info['centered'] else "!!"
+        detection_icon = "TARGET" if ray_info['detected'] else "XX"
+        
+        info = f"""
+  ESTADO DEL SISTEMA
+
+{detection_icon} Deteccion Patron: {'SI' if ray_info['detected'] else 'NO'}
+{status_icon} Rayo Centrado:    {'SI' if ray_info['centered'] else 'NO'}
+
+  POSICION (CAMARA+IMU)
+X (Este):    {x_cam:6.2f} m
+Y (Norte):   {y_cam:6.2f} m
+Orientacion: {math.degrees(psi_cam):6.1f} grados
+Distancia:   {ray_info['distance_cm']:6.0f} cm{diff_str}
+
+  TILT DEL ESPEJO
+Actual:      {current_tilt:6.1f} grados
+Objetivo:    {target_tilt:6.1f} grados
+Error:       {target_tilt - current_tilt:+6.1f} grados
+
+  RAYO
+Brillo:      {ray_info['brightness']:6.0f}
+Offset Y:    {ray_info['offset_y']:+6.1f} px
+Offset X:    {ray_info['offset_x']:+6.1f} px
+        """
+        
+        self.info_text.set_text(info.strip())
+        
+        if 'frame' in ray_info and ray_info['frame'] is not None:
+            frame = ray_info['frame']
+            if len(frame.shape) == 3 and frame.shape[2] == 3:
+                frame_rgb = frame[:, :, ::-1]
+            else:
+                frame_rgb = frame
+            
+            self.camera_image.set_data(frame_rgb)
+            
+            if hasattr(self, 'camera_text') and self.camera_text:
+                self.camera_text.set_visible(False)
+        
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+    
+    def close(self):
+        plt.close(self.fig)
+
+# ======================= CONTROLADOR PRINCIPAL =======================
+class TiltCameraController:
+    def __init__(self, cfg: Config, enable_odrive: bool = False):
+        self.cfg = cfg
+        self.canm = CanManager(cfg)
+        self.mpu = MPU6050(cfg)
+        self.tilt = TiltActuator(cfg, self.canm, self.mpu)
+        self.camera = CameraDetection(cfg)
+        
+        self.enable_odrive = enable_odrive
+        if enable_odrive:
+            self.odrive = ODriveCanDriver(cfg, self.canm)
+            self.odrive.start()
+            self.wheel_odom = WheelOdometry(cfg, initial_x=0.0, initial_y=0.0, initial_psi=0.0)
+        else:
+            self.odrive = None
+            self.wheel_odom = None
+        
+        print("\n📊 Creando ventana de visualizacion...")
+        self.map_viz = MapVisualizer(cfg)
+        mode_str = "tilt+camara+ODrive+Odometria" if enable_odrive else "tilt+camara"
+        print(f"\n✅ Controlador {mode_str} inicializado\n")
+    
+    def run_test(self, target_tilt_deg: float, duration_s: float = 120.0):
+        print("=" * 80)
+        print(f"TEST DE TILT Y CAMARA")
+        print(f"   Tilt objetivo: {target_tilt_deg:.1f} grados")
+        print(f"   Duracion: {duration_s}s")
+        print("=" * 80)
+        print("\nPresiona Ctrl+C para detener\n")
+        
+        t_start = time.time()
+        
+        try:
+            while (time.time() - t_start) < duration_s:
+                ray_info = self.camera.get_ray_info()
+                
+                self.tilt.set_tilt_deg(target_tilt_deg)
+                self.tilt.update()
+                
+                odom_pose = None
+                if self.wheel_odom:
+                    self.odrive.request_encoder_estimates()
+                    self.odrive.read_encoder_messages()
+                    vR, vL = self.odrive.get_wheel_velocities()
+                    self.wheel_odom.update(vR, vL)
+                    odom_pose = self.wheel_odom.get_pose()
+                
+                current_tilt = self.tilt.get_current_tilt()
+                
+                if current_tilt is not None:
+                    self.map_viz.update(ray_info, current_tilt, target_tilt_deg, odom_pose)
+                
+                if ray_info['detected']:
+                    status = "OK CENTRADO" if ray_info['centered'] else "!! Descentrado"
+                    print(f"\n{status} | "
+                          f"Pos: ({ray_info['x_m']:.2f}, {ray_info['y_m']:.2f})m | "
+                          f"Tilt: {current_tilt:.1f} grados (obj: {target_tilt_deg:.1f} grados) | "
+                          f"Brillo: {ray_info['brightness']:.0f} | "
+                          f"Offset Y: {ray_info['offset_y']:+.1f}px")
+                else:
+                    print(f"\nXX SIN PATRON | Tilt: {current_tilt:.1f} grados (obj: {target_tilt_deg:.1f} grados)")
+                
+                time.sleep(0.05)
+        
+        except KeyboardInterrupt:
+            print("\n\nTest interrumpido por usuario")
+        finally:
+            print("\nDeteniendo sistema...")
+            self.tilt.stop()
+            if self.odrive:
+                self.odrive.stop()
+            self.canm.shutdown()
+            self.map_viz.close()
+            print("✅ Test finalizado")
+    
+    def move_to_position(self, target_x: float, target_y: float, target_tilt: float, 
+                         timeout_s: float = 30.0, position_tolerance: float = 0.1):
+        if not self.odrive:
+            print("XX ODrive no esta habilitado")
+            return False
+        
+        print("=" * 80)
+        print(f"MOVIMIENTO A POSICION XY")
+        print(f"   Objetivo: X={target_x:.2f}m, Y={target_y:.2f}m")
+        print(f"   Tilt objetivo: {target_tilt:.1f} grados")
+        print("=" * 80)
+        print("\nPresiona Ctrl+C para detener\n")
+        
+        t_start = time.time()
+        arrived = False
+        
+        try:
+            while (time.time() - t_start) < timeout_s:
+                ray_info = self.camera.get_ray_info()
+                current_x = ray_info['x_m']
+                current_y = ray_info['y_m']
+                current_psi = ray_info['psi']
+                
+                odom_pose = None
+                if self.wheel_odom:
+                    self.odrive.request_encoder_estimates()
+                    self.odrive.read_encoder_messages()
+                    vR, vL = self.odrive.get_wheel_velocities()
+                    self.wheel_odom.update(vR, vL)
+                    odom_pose = self.wheel_odom.get_pose()
+                
+                arrived = self.odrive.move_to_xy(
+                    target_x, target_y,
+                    current_x, current_y, current_psi,
+                    tolerance_m=position_tolerance
+                )
+                
+                self.tilt.set_tilt_deg(target_tilt)
+                self.tilt.update()
+                current_tilt = self.tilt.get_current_tilt()
+                
+                if current_tilt is not None:
+                    self.map_viz.update(ray_info, current_tilt, target_tilt, odom_pose)
+                
+                distance = math.sqrt((target_x - current_x)**2 + (target_y - current_y)**2)
+                print(f"\rPos: ({current_x:.2f},{current_y:.2f})m | "
+                      f"Objetivo: ({target_x:.2f},{target_y:.2f})m | "
+                      f"Distancia: {distance:.2f}m | "
+                      f"Tilt: {current_tilt:.1f} grados ",
+                      end="", flush=True)
+                
+                if arrived:
+                    print("\n\n✅ Llego a la posicion objetivo!")
+                    break
+                
+                time.sleep(0.05)
+            
+            if not arrived and (time.time() - t_start) >= timeout_s:
+                print("\n\nTimeout alcanzado")
+                return False
+            
+            return arrived
+        
+        except KeyboardInterrupt:
+            print("\n\nMovimiento interrumpido por usuario")
+            return False
+        finally:
+            print("\nDeteniendo movimiento...")
+            if self.odrive:
+                self.odrive.send_wheel_speeds(0.0, 0.0)
+    
+    def test_odrive_movement(self, duration_s: float = 30.0):
+        if not self.odrive:
+            print("XX ODrive no esta habilitado")
+            return
+        
+        print("=" * 80)
+        print("TEST DE MOVIMIENTO ODRIVE")
+        print(f"   Duracion: {duration_s}s")
+        print("=" * 80)
+        print("\nPresiona Ctrl+C para detener\n")
+        
+        t_start = time.time()
+        
+        try:
+            phases = [
+                ("Adelante", 0.2, 0.0, 5.0),
+                ("Girar derecha", 0.0, 0.5, 3.0),
+                ("Adelante", 0.2, 0.0, 5.0),
+                ("Girar izquierda", 0.0, -0.5, 3.0),
+                ("Atras", -0.2, 0.0, 5.0),
+            ]
+            
+            for phase_name, v_forward, omega, phase_duration in phases:
+                phase_start = time.time()
+                print(f"\nFase: {phase_name} (v={v_forward:.2f} m/s, omega={omega:.2f} rad/s)")
+                
+                while (time.time() - phase_start) < phase_duration:
+                    if (time.time() - t_start) > duration_s:
+                        break
+                    
+                    self.odrive.send_body_velocity(v_forward, omega)
+                    
+                    self.odrive.request_encoder_estimates()
+                    self.odrive.read_encoder_messages()
+                    vR, vL = self.odrive.get_wheel_velocities()
+                    self.wheel_odom.update(vR, vL)
+                    odom_pose = self.wheel_odom.get_pose()
+                    
+                    ray_info = self.camera.get_ray_info()
+                    current_tilt = self.tilt.get_current_tilt()
+                    
+                    if current_tilt is not None:
+                        self.map_viz.update(ray_info, current_tilt, 0.0, odom_pose)
+                    
+                    print(f"\rPos: ({ray_info['x_m']:.2f}, {ray_info['y_m']:.2f})m | "
+                          f"Psi: {math.degrees(ray_info['psi']):.1f} grados ",
+                          end="", flush=True)
+                    
+                    time.sleep(0.05)
+                
+                if (time.time() - t_start) > duration_s:
+                    break
+            
+            print("\n\n✅ Test completado")
+        
+        except KeyboardInterrupt:
+            print("\n\nTest interrumpido por usuario")
+        finally:
+            print("\nDeteniendo ODrive...")
+            self.odrive.send_wheel_speeds(0.0, 0.0)
+
+# ======================= MENU INTERACTIVO =======================
+def show_menu():
+    print("\n" + "="*80)
+    print("  SISTEMA DE CONTROL HELIOSTATO - MENU PRINCIPAL")
+    print("="*80)
+    
+    print("\nMODOS DE OPERACION:")
+    print("  [1] Test estatico    - Solo tilt y camara (sin movimiento)")
+    print("  [2] Test movimiento  - Secuencia automatica con ODrive")
+    print("  [3] Ir a posicion XY - Mover a coordenadas especificas")
+    
+    while True:
+        try:
+            modo = input("\nSelecciona modo [1-3]: ").strip()
+            if modo in ['1', '2', '3']:
+                break
+            print("XX Opcion invalida. Elige 1, 2 o 3")
+        except KeyboardInterrupt:
+            print("\n\nCancelado por usuario")
+            sys.exit(0)
+    
+    mode_map = {'1': 'test_static', '2': 'test_movement', '3': 'goto_position'}
+    test_mode = mode_map[modo]
+    
+    print("\nCONFIGURACION:")
+    while True:
+        try:
+            target_tilt = float(input("Angulo tilt del espejo (0-90 grados) [default: 30]: ").strip() or "30")
+            if 0 <= target_tilt <= 90:
+                break
+            print("XX El angulo debe estar entre 0 y 90 grados")
+        except ValueError:
+            print("XX Ingresa un numero valido")
+        except KeyboardInterrupt:
+            print("\n\nCancelado por usuario")
+            sys.exit(0)
+    
+    target_x = target_y = None
+    if test_mode == 'goto_position':
+        print("\nPOSICION OBJETIVO (respecto a la torre):")
+        while True:
+            try:
+                target_x = float(input("Coordenada X en metros (Este +) [default: 2.0]: ").strip() or "2.0")
+                target_y = float(input("Coordenada Y en metros (Norte +) [default: 5.0]: ").strip() or "5.0")
+                break
+            except ValueError:
+                print("XX Ingresa numeros validos")
+            except KeyboardInterrupt:
+                print("\n\nCancelado por usuario")
+                sys.exit(0)
+    
+    while True:
+        try:
+            duration = float(input("Duracion del test en segundos [default: 120]: ").strip() or "120")
+            if duration > 0:
+                break
+            print("XX La duracion debe ser positiva")
+        except ValueError:
+            print("XX Ingresa un numero valido")
+        except KeyboardInterrupt:
+            print("\n\nCancelado por usuario")
+            sys.exit(0)
+    
+    return test_mode, target_tilt, target_x, target_y, duration
+
+# ======================= MAIN =======================
+def main():
+    cfg = Config()
+    
+    cfg.wheel_radius = 0.08
+    cfg.wheelbase = 0.30
+    cfg.node_right = 1
+    cfg.node_left = 2
+    cfg.max_linear_speed = 0.5
+    cfg.max_angular_speed = 1.0
+    cfg.brightness_threshold = 200
+    
+    test_mode, target_tilt, target_x, target_y, test_duration = show_menu()
+    
+    print("\n" + "="*80)
+    if test_mode == "test_static":
+        print("  TEST DE LABORATORIO - SOLO TILT Y CAMARA")
+        print("="*80)
+        
+        controller = TiltCameraController(cfg, enable_odrive=False)
+        controller.run_test(target_tilt, duration_s=test_duration)
+    
+    elif test_mode == "test_movement":
+        print("  TEST DE MOVIMIENTO CON ODRIVE")
+        print("="*80)
+        
+        controller = TiltCameraController(cfg, enable_odrive=True)
+        controller.test_odrive_movement(duration_s=test_duration)
+    
+    elif test_mode == "goto_position":
+        print("  MOVIMIENTO A POSICION XY")
+        print(f"  Objetivo: X={target_x:.2f}m, Y={target_y:.2f}m")
+        print(f"  Tilt: {target_tilt:.1f} grados")
+        print("="*80)
+        
+        input("\nColoca el heliostato en posicion inicial y presiona ENTER...")
+        
+        controller = TiltCameraController(cfg, enable_odrive=True)
+        success = controller.move_to_position(target_x, target_y, target_tilt,
+                                             timeout_s=60.0, position_tolerance=0.15)
+        if success:
+            print("\n✅ Mision cumplida!")
+            print("\nManteniendo posicion por 30s...")
+            controller.run_test(target_tilt, duration_s=30.0)
+        else:
+            print("\nXX No se pudo alcanzar la posicion")
+
+if __name__ == "__main__":
+    main()
