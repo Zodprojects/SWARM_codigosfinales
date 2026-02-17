@@ -4,7 +4,7 @@ CONTROL COMPLETO DE HELIÓSTATO - TILT, CÁMARA Y ODRIVE
 
 Incluye:
 - Control de inclinación del espejo (actuador tilt + MPU6050)
-- Detección visual del rayo (cámara + patrón blanco)
+- Detección visual del rayo (cámara + patrón verde)
 - Control de movimiento (ODrive + ruedas)
 - Odometría por encoders Hall (comparación con visión)
 - Menú interactivo
@@ -517,8 +517,8 @@ class CameraDetection:
             pts = self._order4(marcas).astype(np.float32)
             
             for (x, y) in pts:
-                self.cv2.circle(frame_u, (int(x), int(y)), 8, (255, 255, 255), -1)
-                self.cv2.circle(frame_u, (int(x), int(y)), 10, (200, 200, 200), 2)
+                self.cv2.circle(frame_u, (int(x), int(y)), 8, (0, 255, 0), -1)
+                self.cv2.circle(frame_u, (int(x), int(y)), 10, (0, 200, 0), 2)
             
             ok, rvec, tvec = self.cv2.solvePnP(self.object_points, pts, self.camera_matrix,
                                                self.dist_coeffs, flags=self.cv2.SOLVEPNP_IPPE_SQUARE)
@@ -806,7 +806,7 @@ class TiltCameraController:
         print("\n" + "="*80)
         print("⏳ ESPERANDO DETECCION DEL PATRON DE LA TORRE...")
         print("="*80)
-        print("Posiciona el heliostato para que la camara vea el patron blanco (4 esquinas)")
+        print("Posiciona el heliostato para que la camara vea el patron verde (4 esquinas)")
         print("Presiona Ctrl+C para cancelar\n")
         
         t_start = time.time()
