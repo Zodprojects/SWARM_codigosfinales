@@ -261,11 +261,18 @@ def precompute_solarpilot_for_traj(cp, r, t_list, x_traj, y_traj, t_traj,
     if nan_count > 0:
         print(f"[WARN] {nan_count}/{len(result['eta_no_sb'])} puntos con NaN (problemas de división o factores inválidos)")
     
-    # Encontrar heliostat fijo con mejor eficiencia promedio
+    # Determinar el conjunto de heliostatos asociados a la trayectoria
+    # (aquellos que fueron elegidos como el más cercano en algún timestep)
+    traj_ids = set([sid for sid in result["sol_id"] if sid is not None and sid != -1])
+    if not traj_ids:
+        # Si no se detectaron heliostatos cercanos, considerar todos los ids
+        traj_ids = set(eta_by_id.keys())
+
+    # Encontrar heliostat fijo con mejor eficiencia promedio entre los de la trayectoria
     best_fixed_id = None
     best_fixed_eta = -1.0
-    
-    for hid, etas in eta_by_id.items():
+    for hid in traj_ids:
+        etas = eta_by_id.get(hid, [])
         if not etas:
             continue
         valid_etas = [e for e in etas if np.isfinite(e)]
@@ -275,6 +282,9 @@ def precompute_solarpilot_for_traj(cp, r, t_list, x_traj, y_traj, t_traj,
         if mean_eta > best_fixed_eta:
             best_fixed_eta = mean_eta
             best_fixed_id = hid
+
+    # Guardar ids de trayectoria en el resultado para trazabilidad
+    result['traj_ids'] = list(traj_ids)
     
     # Extraer serie temporal del heliostat fijo
     fixed_eta_series = []
@@ -1199,14 +1209,16 @@ def main():
                     hel_positions_opt = []
                     hel_positions_circ = []
                     
-                    if px_opt is not None and py_opt is not None:
-                        d2_opt = (XY[:,0] - px_opt)**2 + (XY[:,1] - py_opt)**2
-                        idx_opt = int(np.argmin(d2_opt))
+                    # Mostrar en el layout los heliostatos fijos seleccionados por SolarPILOT
+                    fixed_opt_id = sol_opt_results.get('fixed_id') if sol_opt_results else None
+                    fixed_circ_id = sol_circ_results.get('fixed_id') if sol_circ_results else None
+
+                    if fixed_opt_id is not None and fixed_opt_id in ids_list:
+                        idx_opt = ids_list.index(fixed_opt_id)
                         hel_positions_opt = [XY[idx_opt, 0]], [XY[idx_opt, 1]]
-                    
-                    if px_circ is not None and py_circ is not None:
-                        d2_circ = (XY[:,0] - px_circ)**2 + (XY[:,1] - py_circ)**2
-                        idx_circ = int(np.argmin(d2_circ))
+
+                    if fixed_circ_id is not None and fixed_circ_id in ids_list:
+                        idx_circ = ids_list.index(fixed_circ_id)
                         hel_positions_circ = [XY[idx_circ, 0]], [XY[idx_circ, 1]]
                     
                     hel_layout_opt.set_data(hel_positions_opt if hel_positions_opt else ([], []))
