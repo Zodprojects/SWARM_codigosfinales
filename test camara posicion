@@ -1,0 +1,947 @@
+# -*- coding: utf-8 -*-
+"""
+TEST DE CÁMARA Y POSICIONAMIENTO - SIN MPU6050
+===============================================
+Version simplificada de Camara + feddback verde + odrive.py
+enfocada en probar el sistema de visión y navegación.
+
+Eliminado:
+  - MPU6050 (interferencia EMI)
+  - Actuador tilt (sin feedback IMU no tiene sentido)
+
+Incluye:
+  - BNO055 para yaw/heading
+  - Picamera2 + detección de marcas verdes (solvePnP)
+  - ODrive para movimiento de ruedas
+  - Odometría por encoders
+  - Visualización en tiempo real (mapa + cámara + datos)
+
+Uso:
+  python test_camara_posicion.py
+  El script pregunta por consola todas las dimensiones y parámetros.
+"""
+
+from __future__ import annotations
+import math, time, struct, sys
+from dataclasses import dataclass, field
+from typing import Optional, Dict
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.patches import FancyArrow, Circle
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN (se rellena en el setup interactivo)
+# ═══════════════════════════════════════════════════════════════
+@dataclass
+class Config:
+    # ── Torre ──
+    tower_height: float = 3.0
+
+    # ── CAN / ODrive ──
+    can_channel:       str   = "can0"
+    can_bitrate:       int   = 500_000
+    node_right:        int   = 1
+    node_left:         int   = 2
+    wheel_radius:      float = 0.08
+    gear_ratio:        float = 1.0
+    wheelbase:         float = 0.30
+    vmax_rev_s_clip:   float = 20.0
+    sign_R:            float = +1.0
+    sign_L:            float = +1.0
+    max_linear_speed:  float = 0.5
+    max_angular_speed: float = 1.0
+
+    # ── BNO055 ──
+    bno_addr: int = 0x28   # 0x28 o 0x29 según pin ADR
+
+    # ── Marcas verdes (se piden por consola) ──
+    mark_width_cm:  float = 6.0    # distancia horizontal entre marcas (cm)
+    mark_height_cm: float = 10.0   # distancia vertical entre marcas (cm)
+
+    # ── Umbral de brillo para rayo centrado ──
+    brightness_threshold: int = 200
+
+    # ── Tolerancia de llegada (m) ──
+    position_tolerance: float = 0.10
+
+    # ── Calibración cámara (se puede sustituir por consola) ──
+    use_default_calibration: bool = True
+    # Si use_default_calibration=False se pedirán fx, fy, cx, cy por consola
+
+
+# ═══════════════════════════════════════════════════════════════
+#  UTILIDADES
+# ═══════════════════════════════════════════════════════════════
+def wrap_angle(a: float) -> float:
+    while a <= -math.pi: a += 2 * math.pi
+    while a > math.pi:   a -= 2 * math.pi
+    return a
+
+
+def ask_float(prompt: str, default: float, min_val: float = None, max_val: float = None) -> float:
+    while True:
+        try:
+            raw = input(f"  {prompt} [default: {default}]: ").strip()
+            val = float(raw) if raw else default
+            if min_val is not None and val < min_val:
+                print(f"    ✘ Valor mínimo: {min_val}")
+                continue
+            if max_val is not None and val > max_val:
+                print(f"    ✘ Valor máximo: {max_val}")
+                continue
+            return val
+        except ValueError:
+            print("    ✘ Introduce un número válido")
+        except KeyboardInterrupt:
+            print("\n\nSetup cancelado por usuario")
+            sys.exit(0)
+
+
+def ask_int(prompt: str, default: int, min_val: int = None, max_val: int = None) -> int:
+    while True:
+        try:
+            raw = input(f"  {prompt} [default: {default}]: ").strip()
+            val = int(raw) if raw else default
+            if min_val is not None and val < min_val:
+                print(f"    ✘ Valor mínimo: {min_val}")
+                continue
+            if max_val is not None and val > max_val:
+                print(f"    ✘ Valor máximo: {max_val}")
+                continue
+            return val
+        except ValueError:
+            print("    ✘ Introduce un número entero válido")
+        except KeyboardInterrupt:
+            print("\n\nSetup cancelado por usuario")
+            sys.exit(0)
+
+
+def ask_yn(prompt: str, default: bool = True) -> bool:
+    default_str = "s" if default else "n"
+    while True:
+        try:
+            raw = input(f"  {prompt} (s/n) [default: {default_str}]: ").strip().lower()
+            if raw == "":
+                return default
+            if raw in ("s", "si", "y", "yes"):
+                return True
+            if raw in ("n", "no"):
+                return False
+            print("    ✘ Responde s o n")
+        except KeyboardInterrupt:
+            print("\n\nSetup cancelado por usuario")
+            sys.exit(0)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  SETUP INTERACTIVO
+# ═══════════════════════════════════════════════════════════════
+def setup_interactivo() -> tuple[Config, str, float, float, float, float]:
+    """
+    Pregunta todos los parámetros necesarios por consola.
+    Devuelve (cfg, modo, target_x, target_y, duration, position_tolerance)
+    """
+    print("\n" + "═" * 65)
+    print("  SETUP — CÁMARA + BNO055 + ODRIVE  (sin MPU6050)")
+    print("═" * 65)
+
+    cfg = Config()
+    # Parámetros fijos (hardware conocido — no se preguntan)
+    cfg.bno_addr         = 0x28
+    cfg.node_right       = 1
+    cfg.node_left        = 2
+    cfg.wheel_radius     = 0.08
+    cfg.wheelbase        = 0.30
+    cfg.max_linear_speed = 0.5
+
+    # ── Marcas del patrón ──────────────────────────────────────
+    print("\n  [1/3] DIMENSIONES DEL PATRÓN DE MARCAS VERDES")
+    print("        (mide la distancia entre los centros de las marcas)")
+    cfg.mark_width_cm  = ask_float("Anchura del patrón (cm, eje horizontal)", 6.0,  min_val=0.5)
+    cfg.mark_height_cm = ask_float("Altura del patrón  (cm, eje vertical)",  10.0, min_val=0.5)
+
+    # ── Calibración cámara ────────────────────────────────────
+    print("\n  [2/3] CALIBRACIÓN DE CÁMARA")
+    print("        La calibración por defecto es para la Picamera2 IMX219 a 1280×720.")
+    cfg.use_default_calibration = ask_yn("¿Usar calibración por defecto?", default=True)
+
+    if not cfg.use_default_calibration:
+        print("        Introduce los parámetros de tu calibración:")
+        fx = ask_float("fx (focal length x, px)", 1827.98, min_val=100.0)
+        fy = ask_float("fy (focal length y, px)", 1825.04, min_val=100.0)
+        cx = ask_float("cx (principal point x, px)", 572.34, min_val=0.0)
+        cy = ask_float("cy (principal point y, px)", 362.60, min_val=0.0)
+        cfg._custom_fx = fx
+        cfg._custom_fy = fy
+        cfg._custom_cx = cx
+        cfg._custom_cy = cy
+
+    # ── Modo de operación ─────────────────────────────────────
+    print("\n  [3/3] MODO DE OPERACIÓN")
+    print("        1 - Solo cámara (sin ODrive): ver detección y estimación de posición")
+    print("        2 - Cámara + ODrive: movimiento libre con visualización")
+    print("        3 - Ir a posición XY: navegar a coordenadas respecto a la torre")
+    while True:
+        try:
+            modo_raw = input("  Selecciona modo [1-3]: ").strip()
+            if modo_raw in ("1", "2", "3"):
+                break
+            print("    ✘ Elige 1, 2 o 3")
+        except KeyboardInterrupt:
+            print("\n\nSetup cancelado por usuario")
+            sys.exit(0)
+
+    modo_map = {"1": "solo_camara", "2": "camara_odrive", "3": "goto_position"}
+    modo = modo_map[modo_raw]
+
+    target_x = target_y = 0.0
+    if modo == "goto_position":
+        print("\n  [3b] POSICIÓN OBJETIVO (respecto a la torre en x=0, y=0)")
+        target_x = ask_float("Coordenada X objetivo (m, Este +)",  2.0)
+        target_y = ask_float("Coordenada Y objetivo (m, Norte +)", 5.0)
+        cfg.position_tolerance = ask_float("Tolerancia de llegada (m)", 0.10, min_val=0.02)
+
+    # ── Duración ──────────────────────────────────────────────
+    print("\n  [3c] DURACIÓN DEL TEST")
+    duration = ask_float("Duración (segundos)", 120.0, min_val=5.0)
+
+    # ── Resumen ───────────────────────────────────────────────
+    print("\n" + "─" * 65)
+    print("  RESUMEN DE CONFIGURACIÓN")
+    print("─" * 65)
+    print(f"  Patrón marcas:   {cfg.mark_width_cm:.1f} cm × {cfg.mark_height_cm:.1f} cm")
+    print(f"  Calibración:     {'por defecto' if cfg.use_default_calibration else 'personalizada'}")
+    print(f"  Modo:            {modo}")
+    if modo == "goto_position":
+        print(f"  Objetivo XY:     ({target_x:.2f}, {target_y:.2f}) m  tol={cfg.position_tolerance:.2f}m")
+    print(f"  Duración:        {duration:.0f}s")
+    print("─" * 65)
+
+    if not ask_yn("¿Confirmar y continuar?", default=True):
+        print("  Reiniciando setup...")
+        return setup_interactivo()
+
+    return cfg, modo, target_x, target_y, duration
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ODOMETRÍA
+# ═══════════════════════════════════════════════════════════════
+class WheelOdometry:
+    def __init__(self, cfg: Config, x0=0.0, y0=0.0, psi0=0.0):
+        self.cfg = cfg
+        self.x = x0
+        self.y = y0
+        self.psi = psi0
+        self._t = time.time()
+        print("  ✔ Odometría por encoders inicializada")
+
+    def reset(self, x=0.0, y=0.0, psi=0.0):
+        self.x, self.y, self.psi = x, y, psi
+        self._t = time.time()
+
+    def update(self, vR: float, vL: float):
+        now = time.time()
+        dt = now - self._t
+        if dt <= 0 or dt > 0.5:
+            self._t = now
+            return
+        v     = (vR + vL) / 2.0
+        omega = (vR - vL) / self.cfg.wheelbase
+        self.x   += v * math.sin(self.psi) * dt
+        self.y   += v * math.cos(self.psi) * dt
+        self.psi  = wrap_angle(self.psi + omega * dt)
+        self._t   = now
+
+    def get_pose(self):
+        return self.x, self.y, self.psi
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CAN MANAGER
+# ═══════════════════════════════════════════════════════════════
+class CanManager:
+    def __init__(self, cfg: Config):
+        import can
+        self.bus = can.interface.Bus(channel=cfg.can_channel, bustype="socketcan")
+        print("  ✔ CAN inicializado")
+
+    def shutdown(self):
+        try:
+            self.bus.shutdown()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ODRIVE
+# ═══════════════════════════════════════════════════════════════
+_SET_AXIS_STATE        = 0x07
+_SET_INPUT_VEL         = 0x0D
+_GET_ENCODER_ESTIMATES = 0x09
+_AXIS_IDLE             = 1
+_AXIS_CLOSEDLOOP       = 8
+
+
+class ODriveCanDriver:
+    def __init__(self, cfg: Config, can_mgr: CanManager):
+        self.cfg = cfg
+        self.bus = can_mgr.bus
+        self._enabled = False
+        self._vel_R = self._vel_L = 0.0
+        self._pos_R = self._pos_L = 0.0
+        self._t_enc = time.time()
+        print("  ✔ ODrive CAN driver inicializado")
+
+    def _msg(self, arb_id, data=b""):
+        import can
+        return can.Message(arbitration_id=arb_id, is_extended_id=False, data=data)
+
+    def _set_state(self, node: int, state: int):
+        self.bus.send(self._msg((node << 5) | _SET_AXIS_STATE, struct.pack("<I", state)))
+
+    def start(self):
+        print("  ▶ Iniciando ODrive en closed-loop...")
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            self._set_state(n, _AXIS_CLOSEDLOOP)
+            time.sleep(0.05)
+        self._enabled = True
+        print("  ✔ ODrive en closed-loop")
+
+    def stop(self):
+        try:
+            self.send_wheel_speeds(0.0, 0.0)
+        except Exception:
+            pass
+        time.sleep(0.05)
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            try:
+                self._set_state(n, _AXIS_IDLE)
+            except Exception:
+                pass
+        self._enabled = False
+        print("  ✔ ODrive detenido (idle)")
+
+    def _to_rev(self, v_ms: float) -> float:
+        return (v_ms / (2 * math.pi * self.cfg.wheel_radius)) * self.cfg.gear_ratio
+
+    def send_wheel_speeds(self, vR_ms: float, vL_ms: float):
+        if not self._enabled:
+            return
+        clip = self.cfg.vmax_rev_s_clip
+        vR = max(-clip, min(clip, self.cfg.sign_R * self._to_rev(vR_ms)))
+        vL = max(-clip, min(clip, self.cfg.sign_L * self._to_rev(vL_ms)))
+        self.bus.send(self._msg((self.cfg.node_right << 5) | _SET_INPUT_VEL, struct.pack("<ff", vR, 0.0)))
+        self.bus.send(self._msg((self.cfg.node_left  << 5) | _SET_INPUT_VEL, struct.pack("<ff", vL, 0.0)))
+
+    def send_body_velocity(self, v_fwd: float, omega: float):
+        half = self.cfg.wheelbase / 2.0
+        vR = max(-self.cfg.max_linear_speed, min(self.cfg.max_linear_speed, v_fwd + omega * half))
+        vL = max(-self.cfg.max_linear_speed, min(self.cfg.max_linear_speed, v_fwd - omega * half))
+        self.send_wheel_speeds(vR, vL)
+
+    def move_to_xy(self, tx, ty, cx, cy, psi,
+                   kp_lin=0.3, kp_ang=1.5, tol=0.1) -> bool:
+        dx = tx - cx
+        dy = ty - cy
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist < tol:
+            self.send_wheel_speeds(0.0, 0.0)
+            return True
+        angle_err = wrap_angle(math.atan2(dx, dy) - psi)
+        v_fwd = max(-self.cfg.max_linear_speed,
+                    min(self.cfg.max_linear_speed, kp_lin * dist))
+        omega = max(-self.cfg.max_angular_speed,
+                    min(self.cfg.max_angular_speed, kp_ang * angle_err))
+        if abs(angle_err) > math.radians(30):
+            v_fwd *= 0.3
+        self.send_body_velocity(v_fwd, omega)
+        return False
+
+    def request_encoder_estimates(self):
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            self.bus.send(self._msg((n << 5) | _GET_ENCODER_ESTIMATES))
+
+    def read_encoder_messages(self, timeout=0.01):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.005)
+                if msg is None:
+                    continue
+                nid  = msg.arbitration_id >> 5
+                cmd  = msg.arbitration_id & 0x1F
+                if cmd == _GET_ENCODER_ESTIMATES and len(msg.data) >= 8:
+                    pos, vel = struct.unpack("<ff", msg.data[:8])
+                    if nid == self.cfg.node_right:
+                        self._pos_R, self._vel_R = pos, vel
+                    elif nid == self.cfg.node_left:
+                        self._pos_L, self._vel_L = pos, vel
+                    self._t_enc = time.time()
+            except Exception:
+                pass
+
+    def get_wheel_velocities(self):
+        factor = (2 * math.pi * self.cfg.wheel_radius) / self.cfg.gear_ratio
+        return (self._vel_R * factor * self.cfg.sign_R,
+                self._vel_L * factor * self.cfg.sign_L)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DETECCIÓN CON CÁMARA + BNO055
+# ═══════════════════════════════════════════════════════════════
+class CameraDetection:
+    def __init__(self, cfg: Config):
+        import cv2, board, busio, adafruit_bno055
+        from picamera2 import Picamera2
+
+        self.cv2 = cv2
+        self.cfg = cfg
+
+        # ── Calibración cámara ──────────────────────────────
+        if cfg.use_default_calibration:
+            self.K = np.array([[1.82798542e+03, 0.0, 5.72342464e+02],
+                                [0.0, 1.82504450e+03, 3.62602479e+02],
+                                [0.0, 0.0, 1.0]], dtype=np.float32)
+            self.D = np.array([[4.95174274e-03,  2.65701920e+00,
+                                -1.43227501e-03, -1.14715430e-02,
+                                -1.37391077e+01]], dtype=np.float32)
+        else:
+            fx = getattr(cfg, '_custom_fx', 1827.98)
+            fy = getattr(cfg, '_custom_fy', 1825.04)
+            cx = getattr(cfg, '_custom_cx', 572.34)
+            cy = getattr(cfg, '_custom_cy', 362.60)
+            self.K = np.array([[fx,  0., cx],
+                                [0., fy,  cy],
+                                [0.,  0.,  1.]], dtype=np.float32)
+            self.D = np.zeros((1, 5), dtype=np.float32)
+
+        # ── BNO055 ──────────────────────────────────────────
+        i2c = busio.I2C(board.SCL, board.SDA)
+        self.bno = adafruit_bno055.BNO055_I2C(i2c, address=cfg.bno_addr)
+        print("  ✔ BNO055 inicializado")
+
+        input("  📍 Coloca el robot mirando a la TORRE y pulsa ENTER para tomar referencia de yaw...")
+        self.yaw_ref = self.bno.euler[0] or 0.0
+        print(f"  ✔ Referencia yaw: {self.yaw_ref:.1f}°")
+
+        # ── Cámara ──────────────────────────────────────────
+        self.cam = Picamera2()
+        self.cam.preview_configuration.main.size   = (1280, 720)
+        self.cam.preview_configuration.main.format = "RGB888"
+        self.cam.preview_configuration.align()
+        self.cam.configure("preview")
+        self.cam.start()
+        time.sleep(0.3)
+        print("  ✔ Cámara inicializada (1280×720)")
+
+        # ── Puntos 3D del patrón (4 esquinas, orden: TL, TR, BR, BL) ──
+        w = cfg.mark_width_cm
+        h = cfg.mark_height_cm
+        self.obj_pts = np.array([[0, 0, 0],
+                                  [w, 0, 0],
+                                  [w, h, 0],
+                                  [0, h, 0]], dtype=np.float32)
+        print(f"  ✔ Patrón: {w:.1f} cm × {h:.1f} cm")
+
+    def _detectar_marcas(self, frame):
+        hsv   = self.cv2.cvtColor(frame, self.cv2.COLOR_BGR2HSV)
+        mask  = self.cv2.inRange(hsv,
+                                  np.array([35, 50, 50]),
+                                  np.array([85, 255, 255]))
+        mask  = self.cv2.GaussianBlur(mask, (5, 5), 0)
+        cnts, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL,
+                                         self.cv2.CHAIN_APPROX_SIMPLE)
+        marcas = []
+        for c in cnts:
+            area = self.cv2.contourArea(c)
+            if 30 < area < 1500:
+                M = self.cv2.moments(c)
+                if M["m00"]:
+                    marcas.append([int(M["m10"] / M["m00"]),
+                                   int(M["m01"] / M["m00"])])
+        return np.array(marcas, dtype=np.float32)
+
+    def _order4(self, pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s    = pts.sum(axis=1)
+        d    = np.diff(pts, axis=1)
+        rect[0] = pts[np.argmin(s)]
+        rect[2] = pts[np.argmax(s)]
+        rect[1] = pts[np.argmin(d)]
+        rect[3] = pts[np.argmax(d)]
+        return rect
+
+    def get_info(self) -> Dict:
+        frame   = self.cam.capture_array()
+        frame_u = self.cv2.undistort(frame, self.K, self.D)
+        marcas  = self._detectar_marcas(frame_u)
+
+        try:
+            yaw_now   = self.bno.euler[0] or 0.0
+            pitch_deg = self.bno.euler[2] or 0.0
+        except Exception:
+            yaw_now = self.yaw_ref
+            pitch_deg = 0.0
+
+        yaw_err     = yaw_now - self.yaw_ref
+        yaw_err_rad = math.radians(yaw_err)
+
+        result = {
+            'detected':      False,
+            'centered':      False,
+            'offset_x':      0.0,
+            'offset_y':      0.0,
+            'brightness':    0.0,
+            'distance_cm':   0.0,
+            'x_m':           0.0,
+            'y_m':           0.0,
+            'psi':           wrap_angle(math.radians(yaw_now)),
+            'yaw_deg':       yaw_now,
+            'yaw_err_deg':   yaw_err,
+            'pitch_deg':     pitch_deg,
+            'n_marks':       len(marcas),
+            'frame':         frame_u,
+        }
+
+        if len(marcas) == 4:
+            pts = self._order4(marcas).astype(np.float32)
+
+            # Dibujar esquinas
+            for (x, y) in pts:
+                self.cv2.circle(frame_u, (int(x), int(y)), 8,  (0, 255, 0), -1)
+                self.cv2.circle(frame_u, (int(x), int(y)), 10, (0, 200, 0), 2)
+
+            ok_pnp, rvec, tvec = self.cv2.solvePnP(
+                self.obj_pts, pts, self.K, self.D,
+                flags=self.cv2.SOLVEPNP_IPPE_SQUARE)
+
+            if ok_pnp:
+                dist_cm = float(tvec[2][0])
+                result['distance_cm'] = dist_cm
+                dist_h_cm = dist_cm * max(0.0, math.cos(math.radians(pitch_deg)))
+                result['x_m'] = dist_h_cm * math.sin(yaw_err_rad) / 100.0
+                result['y_m'] = dist_h_cm * math.cos(yaw_err_rad) / 100.0
+
+            # Centro del patrón
+            cx, cy = np.mean(pts, axis=0).astype(int)
+            gray  = self.cv2.cvtColor(frame_u, self.cv2.COLOR_BGR2GRAY)
+            mask2 = np.zeros_like(gray)
+            self.cv2.fillPoly(mask2, [pts.astype(np.int32)], 255)
+            masked = self.cv2.bitwise_and(gray, gray, mask=mask2)
+            _, maxVal, _, maxLoc = self.cv2.minMaxLoc(masked)
+            bright_pt  = maxLoc
+            brightness = float(maxVal)
+            offset_d   = math.hypot(bright_pt[0] - cx, bright_pt[1] - cy)
+
+            result['brightness'] = brightness
+            if brightness >= self.cfg.brightness_threshold and offset_d < 15:
+                result['centered'] = True
+            else:
+                result['offset_x'] = bright_pt[0] - cx
+                result['offset_y'] = bright_pt[1] - cy
+
+            # Dibujar HUD
+            self.cv2.circle(frame_u, (cx, cy), 8, (255, 0, 0), 2)
+            self.cv2.line(frame_u, (cx - 15, cy), (cx + 15, cy), (255, 0, 0), 2)
+            self.cv2.line(frame_u, (cx, cy - 15), (cx, cy + 15), (255, 0, 0), 2)
+            self.cv2.circle(frame_u, bright_pt, 12, (0, 255, 255), 2)
+            if not result['centered']:
+                self.cv2.line(frame_u, (cx, cy), bright_pt, (255, 255, 0), 2)
+
+            # Texto de distancia en imagen
+            if result['distance_cm'] > 0:
+                self.cv2.putText(frame_u,
+                                  f"D={result['distance_cm']:.0f}cm  "
+                                  f"X={result['x_m']:.2f}m  Y={result['y_m']:.2f}m",
+                                  (10, 30), self.cv2.FONT_HERSHEY_SIMPLEX,
+                                  0.8, (0, 255, 0), 2)
+            result['detected'] = True
+        else:
+            # Cuántas marcas se ven (útil para debug)
+            n = len(marcas)
+            color = (0, 200, 255) if n > 0 else (0, 0, 255)
+            self.cv2.putText(frame_u, f"Marcas detectadas: {n}/4  (necesito 4)",
+                              (10, 30), self.cv2.FONT_HERSHEY_SIMPLEX,
+                              0.8, color, 2)
+            for m in marcas:
+                self.cv2.circle(frame_u, (int(m[0]), int(m[1])), 6, (0, 200, 255), 2)
+
+        result['frame'] = frame_u
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════
+#  VISUALIZACIÓN
+# ═══════════════════════════════════════════════════════════════
+class MapVisualizer:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        plt.ion()
+        self.fig = plt.figure(figsize=(18, 7))
+        gs = self.fig.add_gridspec(1, 3, width_ratios=[1.2, 0.8, 1.5])
+        self.ax_map   = self.fig.add_subplot(gs[0])
+        self.ax_info  = self.fig.add_subplot(gs[1])
+        self.ax_cam   = self.fig.add_subplot(gs[2])
+
+        # Mapa
+        self.ax_map.set_xlim(-8, 8)
+        self.ax_map.set_ylim(-1, 12)
+        self.ax_map.set_aspect('equal')
+        self.ax_map.grid(True, alpha=0.3)
+        self.ax_map.set_xlabel('X (m) — Este')
+        self.ax_map.set_ylabel('Y (m) — Norte')
+        self.ax_map.set_title('Mapa — Vista superior', fontweight='bold')
+
+        # Torre
+        self.ax_map.add_patch(Circle((0, 0), 0.3, color='red', alpha=0.8, label='Torre'))
+        self.ax_map.plot([0], [0], 'rx', markersize=15, markeredgewidth=3)
+
+        # Robot (cámara+IMU)
+        self._body_cam = Circle((0, 2), 0.25, color='green', alpha=0.7, label='Cámara+BNO055')
+        self.ax_map.add_patch(self._body_cam)
+        self._arrow_cam  = None
+        self._label_cam  = self.ax_map.text(0, 2, '', fontsize=9, ha='center',
+                                             color='darkgreen', weight='bold')
+
+        # Robot (odometría)
+        self._body_odom = Circle((0, 2), 0.20, color='blue', alpha=0.5,
+                                   linestyle='--', fill=False, linewidth=2,
+                                   label='Odometría encoders')
+        self.ax_map.add_patch(self._body_odom)
+        self._arrow_odom = None
+        self._label_odom = self.ax_map.text(0, 2, '', fontsize=8, ha='center', color='blue')
+
+        self.ax_map.legend(loc='upper right', fontsize=9)
+
+        # Panel de info
+        self.ax_info.axis('off')
+        self._info_txt = self.ax_info.text(0.05, 0.98, 'Inicializando...',
+                                            fontsize=10, va='top',
+                                            fontfamily='monospace')
+
+        # Imagen cámara
+        self.ax_cam.set_title('Visión — Marcas Verdes', fontweight='bold')
+        self.ax_cam.axis('off')
+        placeholder = np.ones((480, 640, 3), dtype=np.uint8) * 60
+        self._cam_img = self.ax_cam.imshow(placeholder)
+
+        plt.tight_layout()
+        self.fig.canvas.draw()
+        plt.show(block=False)
+        plt.pause(0.1)
+        print("  ✔ Ventana de visualización creada")
+
+    def update(self, info: Dict, odom_pose: Optional[tuple] = None,
+               target_xy: Optional[tuple] = None):
+        x_c, y_c  = info['x_m'], info['y_m']
+        psi_c     = info['psi']
+
+        # ── Robot cámara ──
+        self._body_cam.set_center((x_c, y_c))
+        if self._arrow_cam:
+            self._arrow_cam.remove()
+        L  = 0.8
+        dx = L * math.cos(psi_c)
+        dy = L * math.sin(psi_c)
+        self._arrow_cam = FancyArrow(x_c, y_c, dx, dy, width=0.15,
+                                      color='darkgreen', alpha=0.9, zorder=5)
+        self.ax_map.add_patch(self._arrow_cam)
+        self._label_cam.set_position((x_c, y_c - 0.6))
+        self._label_cam.set_text(f'Cam\n({x_c:.2f},{y_c:.2f})')
+
+        # ── Odometría ──
+        diff_str = ""
+        if odom_pose:
+            xo, yo, psio = odom_pose
+            self._body_odom.set_center((xo, yo))
+            self._body_odom.set_visible(True)
+            if self._arrow_odom:
+                self._arrow_odom.remove()
+            self._arrow_odom = FancyArrow(xo, yo,
+                                           L * 0.7 * math.cos(psio),
+                                           L * 0.7 * math.sin(psio),
+                                           width=0.12, color='blue',
+                                           alpha=0.6, zorder=4)
+            self.ax_map.add_patch(self._arrow_odom)
+            self._label_odom.set_position((xo, yo + 0.6))
+            self._label_odom.set_text(f'Odom\n({xo:.2f},{yo:.2f})')
+            self._label_odom.set_visible(True)
+            dx_d = x_c - xo
+            dy_d = y_c - yo
+            diff_str = (f"\n─ COMPARACIÓN ─\n"
+                        f"ΔXY:   {math.hypot(dx_d,dy_d):.3f} m\n"
+                        f"ΔX:   {dx_d:+.3f} m\n"
+                        f"ΔY:   {dy_d:+.3f} m")
+        else:
+            self._body_odom.set_visible(False)
+            self._label_odom.set_visible(False)
+
+        # ── Target ──
+        if target_xy:
+            tx, ty = target_xy
+            if not hasattr(self, '_target_patch'):
+                self._target_patch = self.ax_map.plot(
+                    tx, ty, 'g*', markersize=18, label='Objetivo')[0]
+            else:
+                self._target_patch.set_data([tx], [ty])
+
+        # ── Texto info ──
+        det_str = "✔ PATRÓN detectado" if info['detected'] else "✘ Sin patrón"
+        cen_str = "✔ Rayo centrado"    if info['centered']  else "  Rayo descentrado"
+
+        txt = (f"─ DETECCIÓN ─\n"
+               f"{det_str}\n"
+               f"{cen_str}\n"
+               f"Marcas vistas: {info['n_marks']}/4\n\n"
+               f"─ POSICIÓN (Cám+BNO) ─\n"
+               f"X:    {x_c:+7.3f} m\n"
+               f"Y:    {y_c:+7.3f} m\n"
+               f"Dist: {info['distance_cm']:7.1f} cm\n"
+               f"Yaw:  {info['yaw_deg']:7.1f}°\n"
+               f"ΔYaw: {info['yaw_err_deg']:+7.1f}°\n"
+               f"Pitch:{info['pitch_deg']:7.1f}°\n\n"
+               f"─ RAYO ─\n"
+               f"Brillo:    {info['brightness']:6.0f}\n"
+               f"Offset X:  {info['offset_x']:+6.1f} px\n"
+               f"Offset Y:  {info['offset_y']:+6.1f} px"
+               f"{diff_str}")
+        self._info_txt.set_text(txt)
+
+        # ── Frame cámara ──
+        frame = info.get('frame')
+        if frame is not None:
+            rgb = frame[:, :, ::-1] if frame.ndim == 3 else frame
+            self._cam_img.set_data(rgb)
+
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+
+    def close(self):
+        plt.close(self.fig)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONTROLADOR PRINCIPAL
+# ═══════════════════════════════════════════════════════════════
+class CameraPositionController:
+    def __init__(self, cfg: Config, enable_odrive: bool):
+        self.cfg = cfg
+
+        print("\n  Inicializando hardware...")
+        if enable_odrive:
+            self.canm   = CanManager(cfg)
+            self.odrive = ODriveCanDriver(cfg, self.canm)
+            self.odrive.start()
+            self.odom   = WheelOdometry(cfg)
+        else:
+            self.canm   = None
+            self.odrive = None
+            self.odom   = None
+
+        self.camera = CameraDetection(cfg)
+        self.viz    = MapVisualizer(cfg)
+        print("\n  ✔ Sistema listo\n")
+
+    # ── Parar todo ──────────────────────────────────────────
+    def _stop_all(self):
+        if self.odrive:
+            try:
+                self.odrive.stop()
+            except Exception:
+                pass
+        if self.canm:
+            self.canm.shutdown()
+        self.viz.close()
+
+    # ── Helper: actualizar odometría ────────────────────────
+    def _update_odom(self) -> Optional[tuple]:
+        if not self.odrive or not self.odom:
+            return None
+        self.odrive.request_encoder_estimates()
+        self.odrive.read_encoder_messages()
+        vR, vL = self.odrive.get_wheel_velocities()
+        self.odom.update(vR, vL)
+        return self.odom.get_pose()
+
+    # ════════════════════════════════════════════════════════
+    #  MODO 1 — Solo cámara (sin ODrive)
+    # ════════════════════════════════════════════════════════
+    def run_solo_camara(self, duration_s: float):
+        print("═" * 65)
+        print("  MODO: Solo cámara — Observación y estimación de posición")
+        print(f"  Duración: {duration_s:.0f}s  |  Ctrl+C para salir")
+        print("═" * 65 + "\n")
+        t0 = time.time()
+        try:
+            while time.time() - t0 < duration_s:
+                info = self.camera.get_info()
+                self.viz.update(info)
+                if info['detected']:
+                    print(f"\r  ✔ D={info['distance_cm']:.0f}cm  "
+                          f"X={info['x_m']:+.3f}m  Y={info['y_m']:+.3f}m  "
+                          f"Yaw={info['yaw_deg']:.1f}°  "
+                          f"Marcas={info['n_marks']}/4   ", end="", flush=True)
+                else:
+                    print(f"\r  ✘ Sin patrón ({info['n_marks']}/4 marcas)   ",
+                          end="", flush=True)
+                time.sleep(0.05)
+        except KeyboardInterrupt:
+            print("\n\n  Interrumpido por usuario")
+        finally:
+            self._stop_all()
+
+    # ════════════════════════════════════════════════════════
+    #  MODO 2 — Cámara + ODrive, movimiento libre con lectura
+    # ════════════════════════════════════════════════════════
+    def run_camara_odrive(self, duration_s: float):
+        print("═" * 65)
+        print("  MODO: Cámara + ODrive — visualización durante movimiento")
+        print(f"  Duración: {duration_s:.0f}s  |  Ctrl+C para salir")
+        print("═" * 65 + "\n")
+        print("  El robot hace una secuencia de movimiento sencilla.")
+        print("  Observa cómo varía la detección y la estimación de posición.\n")
+
+        phases = [
+            ("Adelante",       0.20,  0.0, 5.0),
+            ("Giro derecha",   0.0,   0.5, 3.0),
+            ("Adelante",       0.20,  0.0, 5.0),
+            ("Giro izquierda", 0.0,  -0.5, 3.0),
+            ("Atrás",         -0.20,  0.0, 5.0),
+            ("Stop",           0.0,   0.0, 2.0),
+        ]
+
+        t0 = time.time()
+        try:
+            for name, v_fwd, omega, ph_dur in phases:
+                print(f"  Fase: {name}  ({ph_dur:.0f}s)")
+                t_ph = time.time()
+                while time.time() - t_ph < ph_dur:
+                    if time.time() - t0 > duration_s:
+                        break
+                    self.odrive.send_body_velocity(v_fwd, omega)
+                    odom = self._update_odom()
+                    info = self.camera.get_info()
+                    self.viz.update(info, odom_pose=odom)
+                    time.sleep(0.05)
+                if time.time() - t0 > duration_s:
+                    break
+            print("\n  ✔ Secuencia completada")
+        except KeyboardInterrupt:
+            print("\n\n  Interrumpido por usuario")
+        finally:
+            self._stop_all()
+
+    # ════════════════════════════════════════════════════════
+    #  MODO 3 — Ir a posición XY
+    # ════════════════════════════════════════════════════════
+    def run_goto_position(self, target_x: float, target_y: float,
+                           duration_s: float):
+        print("═" * 65)
+        print(f"  MODO: Ir a posición  X={target_x:.2f}m  Y={target_y:.2f}m")
+        print(f"  Tolerancia: {self.cfg.position_tolerance:.2f}m  |  "
+              f"Timeout: {duration_s:.0f}s")
+        print("═" * 65 + "\n")
+
+        # ── Esperar detección inicial ────────────────────────
+        print("  Esperando detección de las 4 marcas antes de mover...")
+        t_wait = time.time()
+        while True:
+            info = self.camera.get_info()
+            odom = self._update_odom()
+            self.viz.update(info, odom_pose=odom,
+                            target_xy=(target_x, target_y))
+            if info['detected']:
+                print(f"\n  ✔ Patrón detectado — D={info['distance_cm']:.0f}cm  "
+                      f"X={info['x_m']:.2f}m  Y={info['y_m']:.2f}m")
+                break
+            elapsed = time.time() - t_wait
+            print(f"\r  ⏳ Buscando patrón ({elapsed:.0f}s)...  "
+                  f"{info['n_marks']}/4 marcas", end="", flush=True)
+            if elapsed > 60.0:
+                print("\n\n  ✘ No se detectó el patrón en 60s. Abortando.")
+                self._stop_all()
+                return
+            time.sleep(0.1)
+
+        # ── Confirmación ────────────────────────────────────
+        if not ask_yn(f"\n  ¿Iniciar movimiento hacia ({target_x:.2f}, {target_y:.2f})?"):
+            print("  Movimiento cancelado por usuario.")
+            self._stop_all()
+            return
+
+        print("\n  ▶ Iniciando navegación...  Ctrl+C para detener\n")
+
+        t0 = time.time()
+        arrived = False
+        try:
+            while time.time() - t0 < duration_s:
+                info  = self.camera.get_info()
+                odom  = self._update_odom()
+                self.viz.update(info, odom_pose=odom,
+                                target_xy=(target_x, target_y))
+
+                if info['detected']:
+                    cx, cy, psi = info['x_m'], info['y_m'], info['psi']
+                else:
+                    # Sin visión: usar odometría como fallback
+                    if odom:
+                        cx, cy, psi = odom
+                    else:
+                        self.odrive.send_wheel_speeds(0.0, 0.0)
+                        print("\r  ✘ Sin visión ni odometría — esperando...", end="")
+                        time.sleep(0.1)
+                        continue
+
+                arrived = self.odrive.move_to_xy(
+                    target_x, target_y, cx, cy, psi,
+                    tol=self.cfg.position_tolerance)
+
+                dist = math.hypot(target_x - cx, target_y - cy)
+                src = "cam" if info['detected'] else "odom"
+                print(f"\r  [{src}] Pos=({cx:.2f},{cy:.2f})  "
+                      f"Objetivo=({target_x:.2f},{target_y:.2f})  "
+                      f"Dist={dist:.3f}m   ", end="", flush=True)
+
+                if arrived:
+                    print(f"\n\n  ✔ ¡Llegué a la posición objetivo! (dist={dist:.3f}m)")
+                    break
+                time.sleep(0.05)
+
+            if not arrived:
+                print("\n\n  ✘ Timeout alcanzado sin llegar al objetivo")
+
+        except KeyboardInterrupt:
+            print("\n\n  Interrumpido por usuario")
+        finally:
+            self._stop_all()
+
+
+# ═══════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════
+def main():
+    cfg, modo, target_x, target_y, duration = setup_interactivo()
+
+    enable_odrive = (modo in ("camara_odrive", "goto_position"))
+
+    ctrl = CameraPositionController(cfg, enable_odrive=enable_odrive)
+
+    if modo == "solo_camara":
+        ctrl.run_solo_camara(duration)
+
+    elif modo == "camara_odrive":
+        ctrl.run_camara_odrive(duration)
+
+    elif modo == "goto_position":
+        ctrl.run_goto_position(target_x, target_y, duration)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nSaliendo...")
+        sys.exit(0)
