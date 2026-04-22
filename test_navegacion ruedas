@@ -1,0 +1,495 @@
+# -*- coding: utf-8 -*-
+"""
+TEST DE NAVEGACIÓN — RUEDAS + ODOMETRÍA
+========================================
+Script sencillo para verificar que las ruedas y la odometría
+funcionan correctamente, sin cámara ni IMU.
+
+Comandos disponibles:
+  adelante  <dist_m> [vel_m/s]    — avanza en línea recta
+  atras     <dist_m> [vel_m/s]    — retrocede en línea recta
+  derecha   <grados>              — gira a la derecha (en curva suave)
+  izquierda <grados>              — gira a la izquierda (en curva suave)
+  ir        <x_m> <y_m> [vel]     — navega a coordenadas XY (curva continua)
+  pose                            — muestra posición y heading actuales
+  reset                           — resetea odometría a (0, 0, 0°)
+  salir                           — para motores y sale
+
+Uso:
+  python test_navegacion_ruedas.py
+"""
+
+from __future__ import annotations
+import math, time, struct, sys
+from dataclasses import dataclass
+from typing import Optional
+
+# ═══════════════════════════════════════════════════════════════
+#  CONFIGURACIÓN HARDWARE
+# ═══════════════════════════════════════════════════════════════
+@dataclass
+class Config:
+    can_channel:      str   = "can0"
+    node_right:       int   = 1       # ID CAN rueda derecha
+    node_left:        int   = 2       # ID CAN rueda izquierda
+    wheel_radius:     float = 0.08    # m
+    gear_ratio:       float = 1.0
+    wheelbase:        float = 0.30    # m (distancia entre ruedas)
+    sign_R:           float = +1.0    # invertir si la rueda va al revés
+    sign_L:           float = +1.0
+    vmax_rev_s_clip:  float = 20.0    # límite rev/s al ODrive
+    max_linear_speed: float = 0.5     # m/s
+    max_angular_speed:float = 2.0     # rad/s
+    # Control de curva
+    kp_lin:           float = 0.5     # ganancia proporcional lineal
+    kp_ang:           float = 2.0     # ganancia proporcional angular
+    arrived_tol:      float = 0.05    # m — tolerancia de llegada
+
+
+# ═══════════════════════════════════════════════════════════════
+#  UTILIDADES
+# ═══════════════════════════════════════════════════════════════
+def wrap_angle(a: float) -> float:
+    while a <= -math.pi: a += 2 * math.pi
+    while a >   math.pi: a -= 2 * math.pi
+    return a
+
+
+def deg2rad(d: float) -> float:
+    return d * math.pi / 180.0
+
+
+# ═══════════════════════════════════════════════════════════════
+#  ODOMETRÍA
+# ═══════════════════════════════════════════════════════════════
+class WheelOdometry:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.x   = 0.0
+        self.y   = 0.0
+        self.psi = 0.0   # heading en radianes (0 = Norte/adelante inicial)
+        self._t  = time.time()
+
+    def reset(self, x=0.0, y=0.0, psi=0.0):
+        self.x, self.y, self.psi = x, y, psi
+        self._t = time.time()
+
+    def update(self, vR: float, vL: float):
+        now = time.time()
+        dt  = now - self._t
+        if dt <= 0 or dt > 0.5:
+            self._t = now
+            return
+        v     = (vR + vL) / 2.0
+        omega = (vR - vL) / self.cfg.wheelbase
+        self.x   += v * math.sin(self.psi) * dt
+        self.y   += v * math.cos(self.psi) * dt
+        self.psi  = wrap_angle(self.psi + omega * dt)
+        self._t   = now
+
+    def pose(self):
+        return self.x, self.y, self.psi
+
+    def __str__(self):
+        return (f"X={self.x:+.3f} m  Y={self.y:+.3f} m  "
+                f"Heading={math.degrees(self.psi):+.1f}°")
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DRIVER ODRIVE CAN
+# ═══════════════════════════════════════════════════════════════
+_SET_AXIS_STATE        = 0x07
+_SET_INPUT_VEL         = 0x0D
+_GET_ENCODER_ESTIMATES = 0x09
+_AXIS_IDLE             = 1
+_AXIS_CLOSEDLOOP       = 8
+
+
+class ODriveCanDriver:
+    def __init__(self, cfg: Config):
+        import can
+        self.cfg     = cfg
+        self.bus     = can.interface.Bus(channel=cfg.can_channel, bustype="socketcan")
+        self._enabled = False
+        self._vel_R  = self._vel_L = 0.0
+        print("  ✔ CAN abierto")
+
+    # ── Mensajes CAN ────────────────────────────────────────
+    def _msg(self, arb_id, data=b""):
+        import can
+        return can.Message(arbitration_id=arb_id, is_extended_id=False, data=data)
+
+    def _set_state(self, node: int, state: int):
+        self.bus.send(self._msg((node << 5) | _SET_AXIS_STATE,
+                                struct.pack("<I", state)))
+
+    # ── Arranque / parada ───────────────────────────────────
+    def start(self):
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            self._set_state(n, _AXIS_CLOSEDLOOP)
+            time.sleep(0.05)
+        self._enabled = True
+        print("  ✔ ODrive en closed-loop")
+
+    def stop(self):
+        self._send_vel(0.0, 0.0)
+        time.sleep(0.05)
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            try:
+                self._set_state(n, _AXIS_IDLE)
+            except Exception:
+                pass
+        self._enabled = False
+        print("  ✔ ODrive detenido (idle)")
+
+    def shutdown(self):
+        try:
+            self.bus.shutdown()
+        except Exception:
+            pass
+
+    # ── Envío de velocidades ────────────────────────────────
+    def _to_rev(self, v_ms: float) -> float:
+        return (v_ms / (2 * math.pi * self.cfg.wheel_radius)) * self.cfg.gear_ratio
+
+    def _send_vel(self, vR_ms: float, vL_ms: float):
+        if not self._enabled:
+            return
+        clip = self.cfg.vmax_rev_s_clip
+        vR = max(-clip, min(clip, self.cfg.sign_R * self._to_rev(vR_ms)))
+        vL = max(-clip, min(clip, self.cfg.sign_L * self._to_rev(vL_ms)))
+        self.bus.send(self._msg((self.cfg.node_right << 5) | _SET_INPUT_VEL,
+                                struct.pack("<ff", vR, 0.0)))
+        self.bus.send(self._msg((self.cfg.node_left  << 5) | _SET_INPUT_VEL,
+                                struct.pack("<ff", vL, 0.0)))
+
+    def send_unicycle(self, v_fwd: float, omega: float):
+        """Convierte velocidad lineal + angular a velocidades de rueda."""
+        v_fwd  = max(-self.cfg.max_linear_speed,  min(self.cfg.max_linear_speed,  v_fwd))
+        omega  = max(-self.cfg.max_angular_speed, min(self.cfg.max_angular_speed, omega))
+        half   = self.cfg.wheelbase / 2.0
+        vR = v_fwd + omega * half
+        vL = v_fwd - omega * half
+        self._send_vel(vR, vL)
+
+    # ── Lectura encoders ────────────────────────────────────
+    def request_encoders(self):
+        for n in (self.cfg.node_right, self.cfg.node_left):
+            self.bus.send(self._msg((n << 5) | _GET_ENCODER_ESTIMATES))
+
+    def read_encoders(self, timeout=0.012):
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            try:
+                msg = self.bus.recv(timeout=0.005)
+                if msg is None:
+                    continue
+                nid = msg.arbitration_id >> 5
+                cmd = msg.arbitration_id & 0x1F
+                if cmd == _GET_ENCODER_ESTIMATES and len(msg.data) >= 8:
+                    _, vel = struct.unpack("<ff", msg.data[:8])
+                    if nid == self.cfg.node_right:
+                        self._vel_R = vel
+                    elif nid == self.cfg.node_left:
+                        self._vel_L = vel
+            except Exception:
+                pass
+
+    def wheel_speeds_ms(self):
+        """Devuelve (vR, vL) en m/s considerando signo."""
+        f = (2 * math.pi * self.cfg.wheel_radius) / self.cfg.gear_ratio
+        return (self._vel_R * f * self.cfg.sign_R,
+                self._vel_L * f * self.cfg.sign_L)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  CONTROLADOR DE MOVIMIENTOS
+# ═══════════════════════════════════════════════════════════════
+class RobotDriver:
+    """
+    Encapsula los movimientos básicos:
+      - recta (adelante / atrás)
+      - giro (curva suave: v_fwd != 0 mientras gira)
+      - ir a XY (control P continuo con curva)
+    """
+    DT = 0.05   # paso de control (s)
+
+    def __init__(self, cfg: Config):
+        self.cfg   = cfg
+        self.drv   = ODriveCanDriver(cfg)
+        self.odom  = WheelOdometry(cfg)
+        self.drv.start()
+
+    def _tick(self):
+        """Lee encoders y actualiza odometría. Devuelve (vR, vL)."""
+        self.drv.request_encoders()
+        self.drv.read_encoders()
+        vR, vL = self.drv.wheel_speeds_ms()
+        self.odom.update(vR, vL)
+        return vR, vL
+
+    # ── 1. Recta ─────────────────────────────────────────────
+    def move_straight(self, dist_m: float, speed_ms: float = 0.3):
+        """
+        Avanza/retrocede dist_m metros a speed_ms m/s.
+        dist_m positivo = adelante, negativo = atrás.
+        """
+        sign     = 1.0 if dist_m >= 0 else -1.0
+        abs_dist = abs(dist_m)
+        speed    = sign * min(abs(speed_ms), self.cfg.max_linear_speed)
+
+        x0, y0, _ = self.odom.pose()
+        print(f"  → Recta {dist_m:+.2f} m  a {speed_ms:.2f} m/s")
+
+        try:
+            while True:
+                self._tick()
+                x, y, _ = self.odom.pose()
+                recorrido = math.hypot(x - x0, y - y0)
+                restante  = abs_dist - recorrido
+
+                if restante <= 0:
+                    break
+
+                # Rampa de frenado: reduce velocidad en el último 20%
+                v = speed
+                if restante < 0.2 * abs_dist:
+                    v = max(sign * 0.08, speed * restante / (0.2 * abs_dist))
+
+                self.drv.send_unicycle(v, 0.0)
+                print(f"\r    recorrido={recorrido:.3f} m  restante={restante:.3f} m  v={v:.2f} m/s   ",
+                      end="", flush=True)
+                time.sleep(self.DT)
+        except KeyboardInterrupt:
+            pass
+
+        self.drv.send_unicycle(0.0, 0.0)
+        print(f"\n  ✔ Listo  |  {self.odom}")
+
+    # ── 2. Giro en curva ─────────────────────────────────────
+    def turn(self, angle_deg: float, v_fwd: float = 0.15):
+        """
+        Gira angle_deg grados (+ = izquierda, - = derecha)
+        mientras avanza a v_fwd m/s → curva suave, no giro en sitio.
+        Si v_fwd=0, gira en sitio.
+        """
+        target_delta = deg2rad(angle_deg)
+        _, _, psi0   = self.odom.pose()
+        target_psi   = wrap_angle(psi0 + target_delta)
+
+        print(f"  → Giro {angle_deg:+.1f}°  (v_fwd={v_fwd:.2f} m/s)")
+
+        try:
+            while True:
+                self._tick()
+                _, _, psi = self.odom.pose()
+                err = wrap_angle(target_psi - psi)
+
+                if abs(err) < deg2rad(2.0):
+                    break
+
+                # omega proporcional al error restante, con límite
+                sign_omega = 1.0 if err > 0 else -1.0
+                omega = sign_omega * min(self.cfg.max_angular_speed,
+                                         self.cfg.kp_ang * abs(err))
+                # Reducir omega al final para suavidad
+                if abs(err) < deg2rad(15):
+                    omega *= abs(err) / deg2rad(15)
+                    omega  = max(sign_omega * deg2rad(10), omega)
+
+                self.drv.send_unicycle(v_fwd, omega)
+                print(f"\r    err={math.degrees(err):+.1f}°  omega={omega:.2f} rad/s   ",
+                      end="", flush=True)
+                time.sleep(self.DT)
+        except KeyboardInterrupt:
+            pass
+
+        self.drv.send_unicycle(0.0, 0.0)
+        print(f"\n  ✔ Listo  |  {self.odom}")
+
+    # ── 3. Ir a XY ───────────────────────────────────────────
+    def goto_xy(self, tx: float, ty: float, speed: float = 0.3):
+        """
+        Navega hacia (tx, ty) con control P continuo.
+        El giro es siempre en curva: omega y v_fwd se envían juntos,
+        el radio de curvatura depende del error angular.
+
+        Fase 1: giro inicial si el error angular es grande (> 40°) y
+                v_fwd reducido para no alejarse en la dirección errónea.
+        Fase 2: convergencia suave con v proporcional a la distancia.
+        """
+        print(f"  → Ir a  X={tx:.2f} m  Y={ty:.2f} m  a {speed:.2f} m/s")
+
+        try:
+            while True:
+                self._tick()
+                x, y, psi = self.odom.pose()
+
+                dx   = tx - x
+                dy   = ty - y
+                dist = math.hypot(dx, dy)
+
+                if dist < self.cfg.arrived_tol:
+                    break
+
+                # Ángulo hacia el objetivo en el frame del mundo
+                bearing      = math.atan2(dx, dy)   # 0 = Norte (Y+)
+                angle_err    = wrap_angle(bearing - psi)
+
+                # Velocidad lineal: proporcional a dist, reducida si error angular grande
+                v_fwd = self.cfg.kp_lin * dist
+                v_fwd = min(speed, v_fwd)
+                # Penalizar avance cuando apunta muy lejos del objetivo
+                v_fwd *= max(0.0, math.cos(angle_err)) ** 2
+
+                # Velocidad angular proporcional al error
+                omega = self.cfg.kp_ang * angle_err
+                omega = max(-self.cfg.max_angular_speed,
+                             min(self.cfg.max_angular_speed, omega))
+
+                self.drv.send_unicycle(v_fwd, omega)
+                print(f"\r    Pos=({x:.2f},{y:.2f})  dist={dist:.3f} m  "
+                      f"err={math.degrees(angle_err):+.1f}°  "
+                      f"v={v_fwd:.2f}  ω={omega:.2f}   ",
+                      end="", flush=True)
+                time.sleep(self.DT)
+        except KeyboardInterrupt:
+            pass
+
+        self.drv.send_unicycle(0.0, 0.0)
+        print(f"\n  ✔ Listo  |  {self.odom}")
+
+    # ── Parada de emergencia ─────────────────────────────────
+    def stop_and_close(self):
+        try:
+            self.drv.stop()
+        except Exception:
+            pass
+        try:
+            self.drv.shutdown()
+        except Exception:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════
+#  BUCLE INTERACTIVO
+# ═══════════════════════════════════════════════════════════════
+HELP = """
+  Comandos:
+    adelante  <dist_m> [vel]       ej: adelante 2.0 0.3
+    atras     <dist_m> [vel]       ej: atras 1.0
+    derecha   <grados> [v_fwd]     ej: derecha 90        (curva con v_fwd=0.15)
+    izquierda <grados> [v_fwd]     ej: izquierda 45 0.0  (giro en sitio)
+    ir        <x> <y> [vel]        ej: ir 2.0 3.0 0.3
+    pose                           muestra posición y heading
+    reset                          resetea odometría a (0,0,0°)
+    ayuda                          muestra esta ayuda
+    salir
+"""
+
+def parse_float(tokens, idx, default):
+    try:
+        return float(tokens[idx])
+    except (IndexError, ValueError):
+        return default
+
+
+def main():
+    print("\n" + "═" * 55)
+    print("  TEST DE NAVEGACIÓN — RUEDAS + ODOMETRÍA")
+    print("═" * 55)
+
+    # Configuración por defecto (hardware fijo)
+    cfg = Config()
+    print(f"\n  Hardware: can0  |  nodo_R={cfg.node_right}  nodo_L={cfg.node_left}")
+    print(f"  Rueda r={cfg.wheel_radius} m  |  wheelbase={cfg.wheelbase} m")
+    print(f"  v_max={cfg.max_linear_speed} m/s  |  ω_max={cfg.max_angular_speed} rad/s")
+
+    raw = input("\n  ¿Usar configuración por defecto? (s/n) [s]: ").strip().lower()
+    if raw in ("n", "no"):
+        try:
+            cfg.node_right  = int(input("    node_right  [1]: ").strip() or "1")
+            cfg.node_left   = int(input("    node_left   [2]: ").strip() or "2")
+            cfg.wheel_radius= float(input("    wheel_radius [0.08]: ").strip() or "0.08")
+            cfg.wheelbase   = float(input("    wheelbase   [0.30]: ").strip() or "0.30")
+            sr = input("    sign_R (1 o -1) [1]: ").strip()
+            cfg.sign_R = float(sr) if sr else 1.0
+            sl = input("    sign_L (1 o -1) [1]: ").strip()
+            cfg.sign_L = float(sl) if sl else 1.0
+        except (ValueError, KeyboardInterrupt):
+            print("\nError en configuración, usando valores por defecto.")
+
+    print("\n  Iniciando ODrive...")
+    try:
+        robot = RobotDriver(cfg)
+    except Exception as e:
+        print(f"\n  ✘ Error al iniciar ODrive: {e}")
+        sys.exit(1)
+
+    print(HELP)
+
+    try:
+        while True:
+            try:
+                line = input("  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+
+            if not line:
+                continue
+
+            tokens = line.lower().split()
+            cmd    = tokens[0]
+
+            if cmd in ("salir", "exit", "quit", "q"):
+                break
+
+            elif cmd == "ayuda":
+                print(HELP)
+
+            elif cmd == "pose":
+                print(f"    {robot.odom}")
+
+            elif cmd == "reset":
+                robot.odom.reset()
+                print("    ✔ Odometría reseteada a (0, 0, 0°)")
+
+            elif cmd == "adelante":
+                dist = parse_float(tokens, 1, 1.0)
+                vel  = parse_float(tokens, 2, 0.3)
+                robot.move_straight(abs(dist), vel)
+
+            elif cmd == "atras":
+                dist = parse_float(tokens, 1, 1.0)
+                vel  = parse_float(tokens, 2, 0.3)
+                robot.move_straight(-abs(dist), vel)
+
+            elif cmd == "derecha":
+                angle  = parse_float(tokens, 1, 90.0)
+                v_fwd  = parse_float(tokens, 2, 0.15)
+                robot.turn(-abs(angle), v_fwd)
+
+            elif cmd == "izquierda":
+                angle  = parse_float(tokens, 1, 90.0)
+                v_fwd  = parse_float(tokens, 2, 0.15)
+                robot.turn(+abs(angle), v_fwd)
+
+            elif cmd == "ir":
+                tx  = parse_float(tokens, 1, 0.0)
+                ty  = parse_float(tokens, 2, 0.0)
+                vel = parse_float(tokens, 3, 0.3)
+                robot.goto_xy(tx, ty, vel)
+
+            else:
+                print(f"    ✘ Comando desconocido: '{cmd}'.  Escribe 'ayuda'.")
+
+    except KeyboardInterrupt:
+        pass
+
+    print("\n  Deteniendo motores...")
+    robot.stop_and_close()
+    print("  ✔ Hasta luego\n")
+
+
+if __name__ == "__main__":
+    main()
